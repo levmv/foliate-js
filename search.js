@@ -3,16 +3,31 @@ const CONTEXT_LENGTH = 50
 
 const normalizeWhitespace = str => str.replace(/\s+/g, ' ')
 
+// Context can span adjacent text nodes when the match is styled inline.
+const collectBefore = (strs, index, offset) => {
+    let str = strs[index].slice(0, offset)
+    for (let i = index - 1; i >= 0 && normalizeWhitespace(str).trim().length < CONTEXT_LENGTH; i--)
+        str = strs[i] + str
+    return str
+}
+
+const collectAfter = (strs, index, offset) => {
+    let str = strs[index].slice(offset)
+    for (let i = index + 1; i < strs.length && normalizeWhitespace(str).trim().length < CONTEXT_LENGTH; i++)
+        str += strs[i]
+    return str
+}
+
 const makeExcerpt = (strs, { startIndex, startOffset, endIndex, endOffset }) => {
     const start = strs[startIndex]
     const end = strs[endIndex]
-    const match = start === end
+    const match = startIndex === endIndex
         ? start.slice(startOffset, endOffset)
         : start.slice(startOffset)
-            + strs.slice(start + 1, end).join('')
+            + strs.slice(startIndex + 1, endIndex).join('')
             + end.slice(0, endOffset)
-    const trimmedStart = normalizeWhitespace(start.slice(0, startOffset)).trimStart()
-    const trimmedEnd = normalizeWhitespace(end.slice(endOffset)).trimEnd()
+    const trimmedStart = normalizeWhitespace(collectBefore(strs, startIndex, startOffset)).trimStart()
+    const trimmedEnd = normalizeWhitespace(collectAfter(strs, endIndex, endOffset)).trimEnd()
     const ellipsisPre = trimmedStart.length < CONTEXT_LENGTH ? '' : '…'
     const ellipsisPost = trimmedEnd.length < CONTEXT_LENGTH ? '' : '…'
     const pre = `${ellipsisPre}${trimmedStart.slice(-CONTEXT_LENGTH)}`
@@ -27,23 +42,21 @@ const simpleSearch = function* (strs, query, options = {}) {
     const lowerHaystack = matchCase ? haystack : haystack.toLocaleLowerCase(locales)
     const needle = matchCase ? query : query.toLocaleLowerCase(locales)
     const needleLength = needle.length
-    let index = -1
-    let strIndex = -1
-    let sum = 0
-    do {
-        index = lowerHaystack.indexOf(needle, index + 1)
-        if (index > -1) {
-            while (sum <= index) sum += strs[++strIndex].length
-            const startIndex = strIndex
-            const startOffset = index - (sum - strs[strIndex].length)
-            const end = index + needleLength
-            while (sum <= end) sum += strs[++strIndex].length
-            const endIndex = strIndex
-            const endOffset = end - (sum - strs[strIndex].length)
-            const range = { startIndex, startOffset, endIndex, endOffset }
-            yield { range, excerpt: makeExcerpt(strs, range) }
+    // Separate cursors preserve overlapping matches across node boundaries.
+    let startIndex = 0, startBase = 0, endIndex = 0, endBase = 0
+    for (let index = lowerHaystack.indexOf(needle); index !== -1;
+        index = lowerHaystack.indexOf(needle, index + 1)) {
+        while (startIndex < strs.length - 1 && startBase + strs[startIndex].length <= index)
+            startBase += strs[startIndex++].length
+        const end = index + needleLength
+        while (endIndex < strs.length - 1 && endBase + strs[endIndex].length < end)
+            endBase += strs[endIndex++].length
+        const range = {
+            startIndex, startOffset: index - startBase,
+            endIndex, endOffset: end - endBase,
         }
-    } while (index > -1)
+        yield { range, excerpt: makeExcerpt(strs, range) }
+    }
 }
 
 const segmenterSearch = function* (strs, query, options = {}) {
@@ -100,12 +113,13 @@ const segmenterSearch = function* (strs, query, options = {}) {
     }
 }
 
-export const search = (strs, query, options) => {
+export function* search(strs, query, options = {}) {
+    if (!query || !strs.length) return
     const { granularity = 'grapheme', sensitivity = 'base' } = options
     if (!Intl?.Segmenter || granularity === 'grapheme'
     && (sensitivity === 'variant' || sensitivity === 'accent'))
-        return simpleSearch(strs, query, options)
-    return segmenterSearch(strs, query, options)
+        return yield* simpleSearch(strs, query, options)
+    return yield* segmenterSearch(strs, query, { ...options, granularity, sensitivity })
 }
 
 export const searchMatcher = (textWalker, opts) => {
