@@ -14,10 +14,43 @@ export class Overlayer {
     get element() {
         return this.#svg
     }
+    // Whole-range rects include block padding and may overlap nested blocks.
+    // Walk text and replaced elements instead, including lists and tables.
+    #getRects(range) {
+        const ancestor = range.commonAncestorContainer
+        if (ancestor.nodeType !== Node.ELEMENT_NODE
+            && ancestor.nodeType !== Node.DOCUMENT_NODE) return Array.from(range.getClientRects())
+        const doc = ancestor.ownerDocument ?? ancestor
+        const walker = doc.createTreeWalker(ancestor,
+            NodeFilter.SHOW_TEXT | NodeFilter.SHOW_CDATA_SECTION | NodeFilter.SHOW_ELEMENT, {
+                acceptNode: node => {
+                    if (!range.intersectsNode(node)) return NodeFilter.FILTER_REJECT
+                    // An SVG is one replaced element; do not draw its text twice.
+                    if (node.parentElement?.closest('svg')) return NodeFilter.FILTER_REJECT
+                    if (node.nodeType !== Node.ELEMENT_NODE) return NodeFilter.FILTER_ACCEPT
+                    return node.matches('img, svg')
+                        ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP
+                },
+            })
+        const rects = []
+        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+            const part = doc.createRange()
+            if (node.nodeType === Node.ELEMENT_NODE) part.selectNode(node)
+            else {
+                part.selectNodeContents(node)
+                if (part.compareBoundaryPoints(Range.START_TO_START, range) < 0)
+                    part.setStart(range.startContainer, range.startOffset)
+                if (part.compareBoundaryPoints(Range.END_TO_END, range) > 0)
+                    part.setEnd(range.endContainer, range.endOffset)
+            }
+            rects.push(...part.getClientRects())
+        }
+        return rects.length ? rects : Array.from(range.getClientRects())
+    }
     add(key, range, draw, options) {
         if (this.#map.has(key)) this.remove(key)
         if (typeof range === 'function') range = range(this.#svg.getRootNode())
-        const rects = range.getClientRects()
+        const rects = this.#getRects(range)
         const element = draw(rects, options)
         this.#svg.append(element)
         this.#map.set(key, { range, draw, options, element, rects })
@@ -31,7 +64,7 @@ export class Overlayer {
         for (const obj of this.#map.values()) {
             const { range, draw, options, element } = obj
             this.#svg.removeChild(element)
-            const rects = range.getClientRects()
+            const rects = this.#getRects(range)
             const el = draw(rects, options)
             this.#svg.append(el)
             obj.element = el
@@ -172,4 +205,3 @@ export class Overlayer {
         return image
     }
 }
-

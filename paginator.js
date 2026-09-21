@@ -207,6 +207,11 @@ const setStylesImportant = (el, styles) => {
     for (const [k, v] of Object.entries(styles)) style.setProperty(k, v, 'important')
 }
 
+const hasActiveTextSelection = doc => {
+    const selection = doc?.getSelection?.()
+    return Boolean(selection?.rangeCount && !selection.isCollapsed)
+}
+
 class View {
     #observer = new ResizeObserver(() => this.expand())
     #element = document.createElement('div')
@@ -830,13 +835,16 @@ export class Paginator extends HTMLElement {
     }
     #onTouchMove(e) {
         const state = this.#touchState
-        if (state.pinched) return
+        if (!state || state.pinched) return
         state.pinched = globalThis.visualViewport.scale > 1
         if (this.scrolled || state.pinched) return
         if (e.touches.length > 1) {
             if (this.#touchScrolled) e.preventDefault()
             return
         }
+        const doc = e.currentTarget?.getSelection ? e.currentTarget : this.#view?.document
+        if (hasActiveTextSelection(doc)) state.selecting = true
+        if (state.selecting) return
         e.preventDefault()
         const touch = e.changedTouches[0]
         const x = touch.screenX, y = touch.screenY
@@ -850,9 +858,10 @@ export class Paginator extends HTMLElement {
         this.#touchScrolled = true
         this.scrollBy(dx, dy)
     }
-    #onTouchEnd() {
+    #onTouchEnd(e) {
         this.#touchScrolled = false
-        if (this.scrolled) return
+        const doc = e.currentTarget?.getSelection ? e.currentTarget : this.#view?.document
+        if (this.scrolled || this.#touchState?.selecting || hasActiveTextSelection(doc)) return
 
         // XXX: Firefox seems to report scale as 1... sometimes...?
         // at this point I'm basically throwing `requestAnimationFrame` at
