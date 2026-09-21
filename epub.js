@@ -92,14 +92,27 @@ const childGetter = (doc, ns) => {
     }
 }
 
+// ZIP entry names are decoded, but encoded separators must remain distinct
+// from the path separators and fragment marker used by navigation.
+const decodeURIPath = path => {
+    try {
+        return decodeURIComponent(path.replace(/%(2f|23)/gi, '%25$1'))
+    } catch {
+        return path
+    }
+}
+
 const resolveURL = (url, relativeTo) => {
     try {
-        if (relativeTo.includes(':')) return new URL(url, relativeTo)
+        if (isExternal(relativeTo)) return new URL(url, relativeTo).href
         // the base needs to be a valid URL, so set a base URL and then remove it
         const root = 'https://invalid.invalid/'
-        const obj = new URL(url, root + relativeTo)
+        // The base is already a ZIP entry name, not an encoded URL.
+        const base = relativeTo.split('/').map(encodeURIComponent).join('/')
+        const obj = new URL(url, root + base)
+        if (!obj.href.startsWith(root)) return obj.href
         obj.search = ''
-        return decodeURI(obj.href.replace(root, ''))
+        return decodeURIPath(obj.href.replace(root, ''))
     } catch(e) {
         console.warn(e)
         return url
@@ -203,7 +216,7 @@ const getMetadata = opf => {
         if (!els) return null
         return Object.groupBy(els.map(parse), x => x.property)
     }
-    const dc = Object.fromEntries(Object.entries(Object.groupBy(els.dc, el => el.localName))
+    const dc = Object.fromEntries(Object.entries(Object.groupBy(els.dc ?? [], el => el.localName))
         .map(([name, els]) => [name, els.map(parse)]))
     const properties = getProperties() ?? {}
     const legacyMeta = Object.fromEntries(els.legacyMeta?.map(el =>
@@ -312,9 +325,12 @@ const getMetadata = opf => {
     return { metadata, rendition, media }
 }
 
+const hasNavigableHref = items => items?.some(({ href, subitems }) =>
+    href || hasNavigableHref(subitems))
+
 const parseNav = (doc, resolve = f => f) => {
     const { $, $$, $$$ } = childGetter(doc, NS.XHTML)
-    const resolveHref = href => href ? decodeURI(resolve(href)) : null
+    const resolveHref = href => href ? resolve(href) : null
     const parseLI = getType => $li => {
         const $a = $($li, 'a') ?? $($li, 'span')
         const $ol = $($li, 'ol')
@@ -345,7 +361,7 @@ const parseNav = (doc, resolve = f => f) => {
 
 const parseNCX = (doc, resolve = f => f) => {
     const { $, $$ } = childGetter(doc, NS.NCX)
-    const resolveHref = href => href ? decodeURI(resolve(href)) : null
+    const resolveHref = href => href ? resolve(href) : null
     const parseItem = el => {
         const $label = $(el, 'navLabel')
         const $content = $(el, 'content')
@@ -551,14 +567,19 @@ class MediaOverlay extends EventTarget {
     }
 }
 
-const isUUID = /([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})/
+const isUUID = /([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})/i
 
 const getUUID = opf => {
-    for (const el of opf.getElementsByTagNameNS(NS.DC, 'identifier')) {
-        const [id] = getElementText(el).split(':').slice(-1)
-        if (isUUID.test(id)) return id
-    }
-    return ''
+    const identifiers = Array.from(opf.getElementsByTagNameNS(NS.DC, 'identifier'))
+    const extractUUID = el => isUUID.exec(getElementText(el))?.[0]
+    const uniqueID = opf.documentElement.getAttribute('unique-identifier')
+    // The package identifier takes precedence over other UUID-shaped metadata.
+    const primary = uniqueID && extractUUID(identifiers
+        .find(el => el.getAttribute('id') === uniqueID))
+    if (primary) return primary
+    const urn = identifiers.find(el => /^urn:uuid:/i.test(getElementText(el))
+        && extractUUID(el))
+    return extractUUID(urn) ?? identifiers.map(extractUUID).find(Boolean) ?? ''
 }
 
 const getIdentifier = opf => getElementText(
@@ -1008,11 +1029,11 @@ ${doc.querySelector('parsererror').innerText}`)
         } catch(e) {
             console.warn(e)
         }
-        if (!this.toc && ncxPath) try {
+        if (!hasNavigableHref(this.toc) && ncxPath) try {
             const resolve = url => resolveURL(url, ncxPath)
             const ncx = parseNCX(await this.#loadXML(ncxPath), resolve)
-            this.toc = ncx.toc
-            this.pageList = ncx.pageList
+            if (hasNavigableHref(ncx.toc)) this.toc = ncx.toc
+            if (!hasNavigableHref(this.pageList)) this.pageList = ncx.pageList
         } catch(e) {
             console.warn(e)
         }
@@ -1047,7 +1068,8 @@ ${doc.querySelector('parsererror').innerText}`)
     }
     resolveHref(href) {
         const [path, hash] = href.split('#')
-        const item = this.resources.getItemByHref(decodeURI(path))
+        const item = this.resources.getItemByHref(path)
+            ?? this.resources.getItemByHref(decodeURIPath(path))
         if (!item) return null
         const index = this.resources.spine.findIndex(({ idref }) => idref === item.id)
         const anchor = hash ? doc => getHTMLFragment(doc, hash) : () => 0
