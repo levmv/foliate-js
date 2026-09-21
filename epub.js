@@ -1,4 +1,5 @@
 import * as CFI from './epubcfi.js'
+import { parseContentDocument, parseXMLDocument, serializeDocument } from './markup.js'
 
 const NS = {
     CONTAINER: 'urn:oasis:names:tc:opendocument:xmlns:container',
@@ -21,6 +22,13 @@ const MIME = {
     CSS: 'text/css',
     SVG: 'image/svg+xml',
     JS: /\/(x-)?(javascript|ecmascript)/,
+}
+
+const resourceTypes = {
+    css: MIME.CSS, svg: MIME.SVG,
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif',
+    webp: 'image/webp', avif: 'image/avif', bmp: 'image/bmp',
+    ttf: 'font/ttf', otf: 'font/otf', woff: 'font/woff', woff2: 'font/woff2',
 }
 
 // https://www.w3.org/TR/epub-33/#sec-reserved-prefixes
@@ -729,9 +737,10 @@ class Loader {
     #children = new Map()
     #refCount = new Map()
     eventTarget = new EventTarget()
-    constructor({ loadText, loadBlob, resources }) {
+    constructor({ loadText, loadBlob, getSize, resources }) {
         this.loadText = loadText
         this.loadBlob = loadBlob
+        this.getSize = getSize
         this.manifest = resources.manifest
         this.assets = resources.manifest
         // needed only when replacing in (X)HTML w/o parsing (see below)
@@ -811,10 +820,20 @@ class Loader {
     }
     async loadHref(href, base, parents = []) {
         if (isExternal(href)) return href
-        const path = resolveURL(href, base)
-        const item = this.manifest.find(item => item.href === path)
+        const resolved = resolveURL(href, base)
+        if (isExternal(resolved)) return href
+        const [path, hash] = resolved.split('#')
+        let item = this.manifest.find(item => item.href === path)
+        if (!item) {
+            const extension = path.slice(path.lastIndexOf('.') + 1).toLowerCase()
+            const mediaType = Object.prototype.hasOwnProperty.call(resourceTypes, extension)
+                ? resourceTypes[extension] : null
+            // Recover only a known resource at its exact path in the container.
+            if (mediaType && this.getSize(path) > 0) item = { href: path, mediaType }
+        }
         if (!item) return href
-        return this.loadItem(item, parents.concat(base))
+        const url = await this.loadItem(item, parents.concat(base))
+        return url && hash ? `${url}#${hash}` : url
     }
     async loadReplaced(item, parents = []) {
         const { href, mediaType } = item
@@ -838,17 +857,11 @@ class Loader {
 
         // parse and replace in HTML
         if ([MIME.XHTML, MIME.HTML, MIME.SVG].includes(mediaType)) {
-            let doc = new DOMParser().parseFromString(str, mediaType)
-            // change to HTML if it's not valid XHTML
-            if (mediaType === MIME.XHTML && (doc.querySelector('parsererror')
-            || !doc.documentElement?.namespaceURI)) {
-                console.warn(doc.querySelector('parsererror')?.innerText ?? 'Invalid XHTML')
-                item.mediaType = MIME.HTML
-                doc = new DOMParser().parseFromString(str, item.mediaType)
-            }
+            const parsed = parseContentDocument(new DOMParser(), str, mediaType)
+            const { doc } = parsed
             // replace hrefs in XML processing instructions
             // this is mainly for SVGs that use xml-stylesheet
-            if ([MIME.XHTML, MIME.SVG].includes(item.mediaType)) {
+            if ([MIME.XHTML, MIME.SVG].includes(parsed.mediaType)) {
                 let child = doc.firstChild
                 while (child instanceof ProcessingInstruction) {
                     if (child.data) {
@@ -885,8 +898,8 @@ class Loader {
                 el.setAttribute('style',
                     await this.replaceCSS(el.getAttribute('style'), href, parents))
             // TODO: replace inline scripts? probably not worth the trouble
-            const result = new XMLSerializer().serializeToString(doc)
-            return this.createURL(href, result, item.mediaType, parent)
+            const result = serializeDocument(doc, parsed.mediaType)
+            return this.createURL(href, result, parsed.mediaType, parent)
         }
 
         const result = mediaType === MIME.CSS
@@ -968,7 +981,7 @@ export class EPUB {
     async #loadXML(uri) {
         const str = await this.loadText(uri)
         if (!str) return null
-        const doc = this.parser.parseFromString(str, MIME.XML)
+        const doc = parseXMLDocument(this.parser, str)
         if (doc.querySelector('parsererror'))
             throw new Error(`XML parsing error: ${uri}
 ${doc.querySelector('parsererror').innerText}`)
@@ -997,6 +1010,7 @@ ${doc.querySelector('parsererror').innerText}`)
         })
         this.#loader = new Loader({
             loadText: this.loadText,
+            getSize: this.getSize,
             loadBlob: uri => Promise.resolve(this.loadBlob(uri))
                 .then(this.#encryption.getDecoder(uri)),
             resources: this.resources,
@@ -1063,7 +1077,7 @@ ${doc.querySelector('parsererror').innerText}`)
     }
     async loadDocument(item) {
         const str = await this.loadText(item.href)
-        return this.parser.parseFromString(str, item.mediaType)
+        return parseContentDocument(this.parser, str, item.mediaType).doc
     }
     getMediaOverlay() {
         return new MediaOverlay(this, this.#loadXML.bind(this))

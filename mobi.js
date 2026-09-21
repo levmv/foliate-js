@@ -1,3 +1,5 @@
+import { expandEmptyElements, parseContentDocument, serializeDocument } from './markup.js'
+
 const unescapeHTML = str => {
     if (!str) return ''
     const textarea = document.createElement('textarea')
@@ -669,7 +671,6 @@ function rawBytesToString(uint8Array) {
 
 class MOBI6 {
     parser = new DOMParser()
-    serializer = new XMLSerializer()
     #resourceCache = new Map()
     #textCache = new Map()
     #cache = new Map()
@@ -844,7 +845,7 @@ class MOBI6 {
     }
     async createDocument(section) {
         const str = await this.loadText(section)
-        return this.parser.parseFromString(str, this.#type)
+        return this.parser.parseFromString(expandEmptyElements(str), this.#type)
     }
     async loadSection(section) {
         if (this.#cache.has(section)) return this.#cache.get(section)
@@ -864,7 +865,7 @@ class MOBI6 {
         }`))
 
         await this.replaceResources(doc)
-        const result = this.serializer.serializeToString(doc)
+        const result = serializeDocument(doc, this.#type)
         const url = URL.createObjectURL(new Blob([result], { type: this.#type }))
         this.#cache.set(section, url)
         return url
@@ -940,7 +941,6 @@ const getPageSpread = properties => {
 
 class KF8 {
     parser = new DOMParser()
-    serializer = new XMLSerializer()
     transformTarget = new EventTarget()
     #cache = new Map()
     #fragmentOffsets = new Map()
@@ -1179,25 +1179,20 @@ class KF8 {
     }
     async createDocument(section) {
         const str = await this.loadText(section)
-        return this.parser.parseFromString(str, this.#type)
+        return parseContentDocument(this.parser, str, this.#type).doc
     }
     async loadSection(section) {
         if (this.#cache.has(section)) return this.#cache.get(section)
         const str = await this.loadText(section)
         const replaced = await this.replaceResources(str)
 
-        // by default, type is XHTML; change to HTML if it's not valid XHTML
-        let doc = this.parser.parseFromString(replaced, this.#type)
-        if (doc.querySelector('parsererror') || !doc.documentElement?.namespaceURI) {
-            this.#type = MIME.HTML
-            doc = this.parser.parseFromString(replaced, this.#type)
-        }
+        const { doc, mediaType } = parseContentDocument(this.parser, replaced, this.#type)
         for (const [url, node] of this.#inlineMap) {
             for (const el of doc.querySelectorAll(`img[src="${url}"]`))
                 el.replaceWith(node)
         }
         const url = URL.createObjectURL(
-            new Blob([this.serializer.serializeToString(doc)], { type: this.#type }))
+            new Blob([serializeDocument(doc, mediaType)], { type: mediaType }))
         this.#cache.set(section, url)
         return url
     }
