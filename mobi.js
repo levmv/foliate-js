@@ -952,6 +952,7 @@ class KF8 {
     #rawTail = new Uint8Array()
     #lastLoadedHead = -1
     #lastLoadedTail = -1
+    #rawQueue = Promise.resolve()
     #type = MIME.XHTML
     #inlineMap = new Map()
     constructor(mobi) {
@@ -1115,7 +1116,13 @@ class KF8 {
     // NOTE: there doesn't seem to be a way to access text randomly?
     // how to know the decompressed size of the records without decompressing?
     // 4096 is just the maximum size
-    async loadRaw(start, end) {
+    loadRaw(start, end) {
+        // The shared buffers must grow in record order, even for overlapping reads.
+        const result = this.#rawQueue.then(() => this.#loadRaw(start, end))
+        this.#rawQueue = result.then(() => {}, () => {})
+        return result
+    }
+    async #loadRaw(start, end) {
         // here we load either from the front or back until we have reached the
         // required offsets; at worst you'd have to load half the book at once
         const distanceHead = end - this.#rawHead.length
@@ -1124,18 +1131,23 @@ class KF8 {
         // load from the start
         if (distanceHead < 0 || distanceHead < distanceEnd) {
             while (this.#rawHead.length < end) {
-                const index = ++this.#lastLoadedHead
+                const index = this.#lastLoadedHead + 1
+                if (index >= this.mobi.headers.palmdoc.numTextRecords)
+                    throw new Error('Missing KF8 text record')
                 const data = await this.mobi.loadText(index)
                 this.#rawHead = concatTypedArray(this.#rawHead, data)
+                this.#lastLoadedHead++
             }
             return this.#rawHead.slice(start, end)
         }
         // load from the end
         while (this.#fullRawLength - this.#rawTail.length > start) {
             const index = this.mobi.headers.palmdoc.numTextRecords - 1
-                - (++this.#lastLoadedTail)
+                - (this.#lastLoadedTail + 1)
+            if (index < 0) throw new Error('Missing KF8 text record')
             const data = await this.mobi.loadText(index)
             this.#rawTail = concatTypedArray(data, this.#rawTail)
+            this.#lastLoadedTail++
         }
         const rawTailStart = this.#fullRawLength - this.#rawTail.length
         return this.#rawTail.slice(start - rawTailStart, end - rawTailStart)

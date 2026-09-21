@@ -756,6 +756,11 @@ class Loader {
         return url
     }
     ref(href, parent) {
+        // Each section load is owned by a view and paired with one unload.
+        if (parent == null) {
+            this.#refCount.set(href, this.#refCount.get(href) + 1)
+            return this.#cache.get(href)
+        }
         const childList = this.#children.get(parent)
         if (!childList?.includes(href)) {
             this.#refCount.set(href, this.#refCount.get(href) + 1)
