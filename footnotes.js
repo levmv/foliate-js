@@ -1,7 +1,9 @@
-const getTypes = el => new Set(el?.getAttributeNS?.('http://www.idpf.org/2007/ops', 'type')?.split(' '))
-const getRoles = el => new Set(el?.getAttribute?.('role')?.split(' '))
+const getTypes = el => new Set((el?.getAttributeNS?.('http://www.idpf.org/2007/ops', 'type')
+    ?? el?.getAttribute?.('epub:type'))?.split(/\s+/))
+const getRoles = el => new Set(el?.getAttribute?.('role')?.split(/\s+/))
 
 const isSuper = el => {
+    if (!el) return false
     if (el.matches('sup')) return true
     const { verticalAlign } = getComputedStyle(el)
     return verticalAlign === 'super'
@@ -36,6 +38,7 @@ const getReferencedType = el => {
 const isInline = 'a, span, sup, sub, em, strong, i, b, small, big'
 const extractFootnote = (doc, anchor) => {
     let el = anchor(doc)
+    if (!el?.matches) throw new Error('Failed to extract footnote')
     const target = el
     while (el.matches(isInline)) {
         const parent = el.parentElement
@@ -50,6 +53,22 @@ const extractFootnote = (doc, anchor) => {
     return el
 }
 
+const footnoteRange = (doc, target) => {
+    if (target.startContainer) return target
+    // References often point to a marker inside a list item or definition.
+    let el = target.closest('li, dt') ?? target
+    if (el.matches(isInline)) el = extractFootnote(doc, () => el)
+    const range = doc.createRange()
+    if (el.matches('dt')) {
+        range.setStartBefore(el)
+        let last = el
+        while (last.nextElementSibling?.matches('dd')) last = last.nextElementSibling
+        range.setEndAfter(last)
+    } else if (el.matches('li, aside')) range.selectNodeContents(el)
+    else range.selectNode(el)
+    return range
+}
+
 export class FootnoteHandler extends EventTarget {
     detectFootnotes = true
     #showFragment(book, { index, anchor }, href) {
@@ -62,11 +81,7 @@ export class FootnoteHandler extends EventTarget {
                     const type = getReferencedType(el)
                     const hidden = el?.matches?.('aside') && type === 'footnote'
                     if (el) {
-                        const range = el.startContainer ? el : doc.createRange()
-                        if (!el.startContainer) {
-                            if (el.matches('li, aside')) range.selectNodeContents(el)
-                            else range.selectNode(el)
-                        }
+                        const range = footnoteRange(doc, el)
                         const frag = range.extractContents()
                         doc.body.replaceChildren()
                         doc.body.appendChild(frag)
