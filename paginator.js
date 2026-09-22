@@ -103,21 +103,34 @@ const getVisibleRange = (doc, start, end, mapRect) => {
         // ignore all scripts, styles, and their children
         if (name === 'script' || name === 'style') return FILTER_REJECT
         if (node.nodeType === 1) {
+            const style = doc.defaultView.getComputedStyle(node)
+            if (style.display === 'none') return FILTER_REJECT
+            // Hidden and boxless wrappers can still have visible descendants.
+            if (style.visibility !== 'visible' || !node.getClientRects().length)
+                return FILTER_SKIP
             const { left, right } = mapRect(node.getBoundingClientRect())
             // no need to check child nodes if it's completely out of view
             if (right < start || left > end) return FILTER_REJECT
             // elements must be completely in view to be considered visible
             // because you can't specify offsets for elements
-            if (left >= start && right <= end) return FILTER_ACCEPT
+            if (left >= start && right <= end) {
+                // A wrapper's start may precede hidden descendants. Prefer the
+                // actual visible content, keeping vector images as a single unit.
+                return node.children.length && name !== 'svg' && name !== 'math'
+                    ? FILTER_SKIP : FILTER_ACCEPT
+            }
             // TODO: it should probably allow elements that do not contain text
             // because they can exceed the whole viewport in both directions
             // especially in scrolled mode
         } else {
             // ignore empty text nodes
             if (!node.nodeValue?.trim()) return FILTER_SKIP
+            if (doc.defaultView.getComputedStyle(node.parentElement).visibility !== 'visible')
+                return FILTER_REJECT
             // create range to get rect
             const range = doc.createRange()
             range.selectNodeContents(node)
+            if (!range.getClientRects().length) return FILTER_REJECT
             const { left, right } = mapRect(range.getBoundingClientRect())
             // it's visible if any part of it is in view
             if (right >= start && left <= end) return FILTER_ACCEPT
@@ -365,13 +378,17 @@ class View {
     }
     render(layout) {
         if (!layout || !this.ready) return
+        const doc = this.document
+        // An out-of-flow body cannot fragment across columns or size the scroll area.
+        const position = doc.defaultView.getComputedStyle(doc.body).position
+        if (position === 'absolute' || position === 'fixed')
+            setStylesImportant(doc.body, { 'position': 'static' })
         restoreStyles(this.#fragmentedStyles)
         this.#column = layout.flow !== 'scrolled'
         this.#layout = layout
         this.#rtl = layout.rtl
         restoreStyles(this.#directionStyles)
         if (this.#column && !this.#vertical) {
-            const doc = this.document
             const direction = this.#rtl ? 'rtl' : 'ltr'
             if (doc.defaultView.getComputedStyle(doc.body).direction !== direction) {
                 const children = Array.from(doc.body.children, el =>
@@ -938,6 +955,7 @@ export class Paginator extends HTMLElement {
         return Math.round(this.viewSize / this.size)
     }
     scrollBy(dx, dy) {
+        if (!this.#view?.ready || !this.#scrollBounds) return
         const delta = this.#vertical ? dy : dx
         const element = this.#container
         const { scrollProp } = this
@@ -949,6 +967,7 @@ export class Paginator extends HTMLElement {
             element[scrollProp] + delta))
     }
     async snap(vx, vy) {
+        if (!this.#view?.ready || !this.#scrollBounds) return
         const view = this.#view
         const index = this.#index
         const anchor = this.#anchor
@@ -981,12 +1000,12 @@ export class Paginator extends HTMLElement {
         this.#touchState = {
             x: touch?.screenX, y: touch?.screenY,
             t: e.timeStamp,
-            vx: 0, xy: 0,
+            vx: 0, vy: 0,
         }
     }
     #onTouchMove(e) {
         const state = this.#touchState
-        if (!state || state.pinched) return
+        if (!state || state.pinched || !this.#view?.ready) return
         state.pinched = globalThis.visualViewport.scale > 1
         if (this.scrolled || state.pinched) return
         if (e.touches.length > 1) {
@@ -1012,7 +1031,8 @@ export class Paginator extends HTMLElement {
     #onTouchEnd(e) {
         this.#touchScrolled = false
         const doc = e.currentTarget?.getSelection ? e.currentTarget : this.#view?.document
-        if (this.scrolled || this.#touchState?.selecting || hasActiveTextSelection(doc)) return
+        if (!this.#touchState || this.scrolled || this.#touchState.selecting
+            || hasActiveTextSelection(doc)) return
 
         // XXX: Firefox seems to report scale as 1... sometimes...?
         // at this point I'm basically throwing `requestAnimationFrame` at
@@ -1083,6 +1103,7 @@ export class Paginator extends HTMLElement {
     }
     async #scrollToAnchor(anchor, reason = 'anchor') {
         this.#anchor = anchor
+        if (!(this.size > 0)) return
         const rects = uncollapse(anchor)?.getClientRects?.()
         // if anchor is an element or a range
         if (rects) {
@@ -1090,7 +1111,9 @@ export class Paginator extends HTMLElement {
             // previous column, there is an extra zero width rect in that column
             const rect = Array.from(rects)
                 .find(r => r.width > 0 && r.height > 0) || rects[0]
-            if (!rect) return
+            // A hidden target still needs a settled page and usable swipe bounds.
+            if (!rect) return this.scrolled
+                ? this.#scrollTo(0, reason) : this.#scrollToPage(1, reason)
             await this.#scrollToRect(rect, reason)
             return
         }
@@ -1101,8 +1124,7 @@ export class Paginator extends HTMLElement {
         }
         const { pages } = this
         if (!pages) return
-        const textPages = pages - 2
-        const newPage = Math.round(anchor * (textPages - 1))
+        const newPage = Math.round(anchor * Math.max(0, pages - 3))
         await this.#scrollToPage(newPage + 1, reason)
     }
     #getVisibleRange() {
