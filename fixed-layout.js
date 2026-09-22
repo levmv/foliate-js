@@ -1,28 +1,39 @@
 const parseViewport = str => str
+    ?.replace(/\s*=\s*/g, '=')
     ?.split(/[,;\s]/) // NOTE: technically, only the comma is valid
     ?.filter(x => x)
     ?.map(x => x.split('=').map(x => x.trim()))
+
+const viewportSize = viewport => {
+    const width = Number(viewport?.width), height = Number(viewport?.height)
+    if (Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0)
+        return { width, height }
+}
 
 const getViewport = (doc, viewport) => {
     // use `viewBox` for SVG
     if (doc.documentElement.localName === 'svg') {
         const [, , width, height] = doc.documentElement
-            .getAttribute('viewBox')?.split(/\s/) ?? []
-        return { width, height }
+            .getAttribute('viewBox')?.trim().split(/[\s,]+/) ?? []
+        const size = viewportSize({ width, height })
+        if (size) return size
     }
 
     // get `viewport` `meta` element
     const meta = parseViewport(doc.querySelector('meta[name="viewport"]')
         ?.getAttribute('content'))
-    if (meta) return Object.fromEntries(meta)
+    const metaSize = meta && viewportSize(Object.fromEntries(meta))
+    if (metaSize) return metaSize
 
     // fallback to book's viewport
-    if (typeof viewport === 'string') return parseViewport(viewport)
-    if (viewport?.width && viewport.height) return viewport
+    const bookSize = viewportSize(typeof viewport === 'string'
+        ? Object.fromEntries(parseViewport(viewport)) : viewport)
+    if (bookSize) return bookSize
 
     // if no viewport (possibly with image directly in spine), get image size
     const img = doc.querySelector('img')
-    if (img) return { width: img.naturalWidth, height: img.naturalHeight }
+    const imageSize = img && viewportSize({ width: img.naturalWidth, height: img.naturalHeight })
+    if (imageSize) return imageSize
 
     // just show *something*, i guess...
     console.warn(new Error('Missing viewport properties'))
@@ -87,14 +98,14 @@ export class FixedLayout extends HTMLElement {
         iframe.setAttribute('scrolling', 'no')
         iframe.setAttribute('part', 'filter')
         this.#root.append(element)
-        if (!src) return { blank: true, element, iframe }
+        if (!src) return { index, blank: true, element, iframe }
         return new Promise(resolve => {
             iframe.addEventListener('load', () => {
                 const doc = iframe.contentDocument
                 this.dispatchEvent(new CustomEvent('load', { detail: { doc, index } }))
                 const { width, height } = getViewport(doc, this.defaultViewport)
                 resolve({
-                    element, iframe,
+                    index, element, iframe,
                     width: parseFloat(width),
                     height: parseFloat(height),
                     onZoom,
@@ -105,6 +116,7 @@ export class FixedLayout extends HTMLElement {
     }
     #render(side = this.#side) {
         if (!side) return
+        this.#side = side
         const left = this.#left ?? {}
         const right = this.#center ?? this.#right ?? {}
         const target = side === 'left' ? left : right
@@ -266,6 +278,7 @@ export class FixedLayout extends HTMLElement {
         if (index < 0 || index > this.#spreads.length - 1) return
         if (index === this.#index) {
             this.#render(side)
+            this.#reportLocation(reason)
             return
         }
         this.#index = index
@@ -306,9 +319,11 @@ export class FixedLayout extends HTMLElement {
         if (!s) return this.goToSpread(this.#index - 1, this.rtl ? 'left' : 'right', 'page')
     }
     getContents() {
-        return Array.from(this.#root.querySelectorAll('iframe'), frame => ({
-            doc: frame.contentDocument,
-            // TODO: index, overlayer
+        const frames = this.#center ? [this.#center] : [this.#left, this.#right]
+        return frames.filter(frame => frame && !frame.blank).map(frame => ({
+            index: frame.index,
+            doc: frame.iframe.contentDocument,
+            // TODO: overlayer
         }))
     }
     destroy() {
