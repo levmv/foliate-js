@@ -345,6 +345,12 @@ export class View extends HTMLElement {
 
         this.#handleLinks(doc, index)
         this.#cursorAutohider.cloneFor(doc.documentElement)
+        // Fixed-layout renderers may replace the overlay after zooming.
+        doc.addEventListener('click', e => {
+            const [value, range] = this.#getOverlayer(index)?.overlayer.hitTest(e) ?? []
+            if (value && !value.startsWith(SEARCH_PREFIX))
+                this.#emit('show-annotation', { value, index, range })
+        }, false)
 
         this.#emit('load', { doc, index })
     }
@@ -394,7 +400,7 @@ export class View extends HTMLElement {
                 this.#emit('draw-annotation', { draw, annotation, doc, range })
             }
         }
-        const label = this.#tocProgress.getProgress(index)?.label ?? ''
+        const label = this.#tocProgress?.getProgress(index)?.label ?? ''
         return { index, label }
     }
     deleteAnnotation(annotation) {
@@ -406,13 +412,6 @@ export class View extends HTMLElement {
     }
     #createOverlayer({ doc, index }) {
         const overlayer = new Overlayer()
-        doc.addEventListener('click', e => {
-            const [value, range] = overlayer.hitTest(e)
-            if (value && !value.startsWith(SEARCH_PREFIX)) {
-                this.#emit('show-annotation', { value, index, range })
-            }
-        }, false)
-
         const list = this.#searchResults.get(index)
         if (list) for (const item of list) this.addAnnotation(item)
 
@@ -424,9 +423,11 @@ export class View extends HTMLElement {
         const resolved = await this.goTo(value)
         if (resolved) {
             const { index, anchor } = resolved
-            const { doc } =  this.#getOverlayer(index)
-            const range = anchor(doc)
-            this.#emit('show-annotation', { value, index, range })
+            const obj = this.#getOverlayer(index)
+            if (obj) {
+                const range = anchor(obj.doc)
+                if (range) this.#emit('show-annotation', { value, index, range })
+            }
         }
     }
     getCFI(index, range) {
