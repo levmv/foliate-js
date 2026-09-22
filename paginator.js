@@ -594,7 +594,6 @@ export class Paginator extends HTMLElement {
         this.#root.innerHTML = `<style>
         :host {
             display: block;
-            container-type: size;
         }
         :host, #top {
             box-sizing: border-box;
@@ -625,19 +624,17 @@ export class Paginator extends HTMLElement {
                 minmax(var(--_margin), 1fr)
                 minmax(0, var(--_max-height))
                 minmax(var(--_margin), 1fr);
-            &.vertical {
-                --_max-column-count-spread: var(--_max-column-count-portrait);
-                --_max-width: var(--_max-block-size);
-                --_max-height: calc(var(--_max-inline-size) * var(--_max-column-count-spread));
-            }
-            @container (orientation: portrait) {
-                & {
-                    --_max-column-count-spread: var(--_max-column-count-portrait);
-                }
-                &.vertical {
-                    --_max-column-count-spread: var(--_max-column-count);
-                }
-            }
+        }
+        #top.vertical {
+            --_max-column-count-spread: var(--_max-column-count-portrait);
+            --_max-width: var(--_max-block-size);
+            --_max-height: calc(var(--_max-inline-size) * var(--_max-column-count-spread));
+        }
+        #top.portrait {
+            --_max-column-count-spread: var(--_max-column-count-portrait);
+        }
+        #top.portrait.vertical {
+            --_max-column-count-spread: var(--_max-column-count);
         }
         #background {
             grid-column: 1 / -1;
@@ -695,6 +692,7 @@ export class Paginator extends HTMLElement {
         this.#header = this.#root.getElementById('header')
         this.#footer = this.#root.getElementById('footer')
 
+        this.#observer.observe(this)
         this.#observer.observe(this.#container)
         this.#container.addEventListener('scroll', () => this.dispatchEvent(new Event('scroll')))
         this.#container.addEventListener('scroll', debounce(() => {
@@ -794,7 +792,7 @@ export class Paginator extends HTMLElement {
             const h = innerHeight
             detail.data = Promise.resolve(detail.data).then(data => data
                 // unprefix as most of the props are (only) supported unprefixed
-                .replace(/(?<=[{\s;])-epub-/gi, '')
+                .replace(/([{\s;])-epub-/gi, '$1')
                 // replace vw and vh as they cause problems with layout
                 .replace(/(\d*\.?\d+)vw/gi, (_, d) => parseFloat(d) * w / 100 + 'px')
                 .replace(/(\d*\.?\d+)vh/gi, (_, d) => parseFloat(d) * h / 100 + 'px')
@@ -826,6 +824,8 @@ export class Paginator extends HTMLElement {
         this.#rtl = !vertical && (this.bookDir === 'rtl'
             || this.bookDir !== 'ltr' && rtl)
         this.#top.classList.toggle('vertical', vertical)
+        const host = this.getBoundingClientRect()
+        this.#top.classList.toggle('portrait', host.height >= host.width)
 
         // set background to `doc` background
         // this is needed because the iframe does not fill the whole element
@@ -1261,8 +1261,8 @@ export class Paginator extends HTMLElement {
         return this.goTo({ index })
     }
     lastSection() {
-        const index = this.sections.findLastIndex(section => section.linear !== 'no')
-        return this.goTo({ index })
+        for (let index = this.sections.length - 1; index >= 0; index--)
+            if (this.sections[index].linear !== 'no') return this.goTo({ index })
     }
     getContents() {
         if (this.#view) return [{

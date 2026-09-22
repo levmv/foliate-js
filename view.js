@@ -281,11 +281,12 @@ export class View extends HTMLElement {
                         el.classList.add(activeClass)
                         if (playbackActiveClass) el.ownerDocument
                             .documentElement.classList.add(playbackActiveClass)
-                        lastActive = new WeakRef(el)
+                        lastActive = typeof WeakRef === 'function' ? new WeakRef(el) : { deref: () => el }
                     })
             })
             this.mediaOverlay.addEventListener('unhighlight', () => {
                 const el = lastActive?.deref()
+                lastActive = null
                 if (el) {
                     el.classList.remove(activeClass)
                     if (playbackActiveClass) el.ownerDocument

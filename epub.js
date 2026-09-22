@@ -191,12 +191,25 @@ const getPropertyURL = (value, prefixes) => {
     return baseURL ? baseURL + reference : null
 }
 
+const groupBy = (items, getKey) => {
+    const groups = new Map()
+    for (const item of items) {
+        const key = getKey(item)
+        const group = groups.get(key)
+        if (group) group.push(item)
+        else groups.set(key, [item])
+    }
+    return groups
+}
+const groupByObject = (items, getKey) =>
+    Object.assign(Object.create(null), Object.fromEntries(groupBy(items, getKey)))
+
 const getMetadata = opf => {
     const { $ } = childGetter(opf, NS.OPF)
     const $metadata = $(opf.documentElement, 'metadata')
 
     // first pass: convert to JS objects
-    const els = Object.groupBy($metadata.children, el =>
+    const els = groupByObject($metadata.children, el =>
         el.namespaceURI === NS.DC ? 'dc'
         : el.namespaceURI === NS.OPF && el.localName === 'meta' ?
             (el.hasAttribute('name') ? 'legacyMeta' : 'meta') : '')
@@ -218,13 +231,13 @@ const getMetadata = opf => {
                 .map(attr => [attr.localName, attr.value])),
         }
     }
-    const refines = Map.groupBy(els.meta ?? [], el => el.getAttribute('refines'))
+    const refines = groupBy(els.meta ?? [], el => el.getAttribute('refines'))
     const getProperties = el => {
         const els = refines.get(el ? '#' + el.getAttribute('id') : null)
         if (!els) return null
-        return Object.groupBy(els.map(parse), x => x.property)
+        return groupByObject(els.map(parse), x => x.property)
     }
-    const dc = Object.fromEntries(Object.entries(Object.groupBy(els.dc ?? [], el => el.localName))
+    const dc = Object.fromEntries(Object.entries(groupByObject(els.dc ?? [], el => el.localName))
         .map(([name, els]) => [name, els.map(parse)]))
     const properties = getProperties() ?? {}
     const legacyMeta = Object.fromEntries(els.legacyMeta?.map(el =>
@@ -276,7 +289,7 @@ const getMetadata = opf => {
         }
         return value
     }
-    const belongsTo = Object.groupBy(properties['belongs-to-collection'] ?? [],
+    const belongsTo = groupByObject(properties['belongs-to-collection'] ?? [],
         x => prop(x, 'collection-type') === 'series' ? 'series' : 'collection')
     const mainTitle = dc.title?.find(x => prop(x, 'title-type') === 'main') ?? dc.title?.[0]
     const metadata = {
@@ -445,7 +458,7 @@ class MediaOverlay extends EventTarget {
             const src = resolve($audio.getAttribute('src'))
             const begin = parseClock($audio.getAttribute('clipBegin'))
             const end = parseClock($audio.getAttribute('clipEnd'))
-            const last = arr.at(-1)
+            const last = arr[arr.length - 1]
             if (last?.src === src) last.items.push({ text, begin, end })
             else arr.push({ src, items: [{ text, begin, end }] })
             return arr
@@ -612,12 +625,12 @@ const deobfuscators = (sha1 = WebCryptoSHA1) => ({
     'http://www.idpf.org/2008/embedding': {
         key: opf => sha1(getIdentifier(opf)
             // eslint-disable-next-line no-control-regex
-            .replaceAll(/[\u0020\u0009\u000d\u000a]/g, '')),
+            .replace(/[\u0020\u0009\u000d\u000a]/g, '')),
         decode: (key, blob) => deobfuscate(key, 1040, blob),
     },
     'http://ns.adobe.com/pdf/enc#RC': {
         key: opf => {
-            const uuid = getUUID(opf).replaceAll('-', '')
+            const uuid = getUUID(opf).replace(/-/g, '')
             return Uint8Array.from({ length: 16 }, (_, i) =>
                 parseInt(uuid.slice(i * 2, i * 2 + 2), 16))
         },
@@ -722,7 +735,7 @@ class Resources {
         // mainly because Epub.js used to generate wrong ID assertions
         // https://github.com/futurepress/epub.js/issues/1236
         if ($itemref && $itemref.nodeName !== 'idref') {
-            top.at(-1).id = null
+            top[top.length - 1].id = null
             $itemref = CFI.toElement(this.opf, top)
         }
         const idref = $itemref?.getAttribute('idref')
@@ -806,7 +819,7 @@ class Loader {
         const allow = await event.detail.allow
         if (!allow) return null
 
-        const parent = parents.at(-1)
+        const parent = parents[parents.length - 1]
         if (this.#cache.has(href)) return this.ref(href, parent)
 
         const shouldReplace =
@@ -837,7 +850,7 @@ class Loader {
     }
     async loadReplaced(item, parents = []) {
         const { href, mediaType } = item
-        const parent = parents.at(-1)
+        const parent = parents[parents.length - 1]
         let str = ''
         try {
             str = await this.loadText(href)

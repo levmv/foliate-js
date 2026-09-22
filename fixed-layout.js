@@ -54,19 +54,19 @@ export class FixedLayout extends HTMLElement {
     #center
     #side
     #zoom
+    #style = document.createElement('style')
     constructor() {
         super()
 
-        const sheet = new CSSStyleSheet()
-        this.#root.adoptedStyleSheets = [sheet]
-        sheet.replaceSync(`:host {
+        this.#style.textContent = `:host {
             width: 100%;
             height: 100%;
             display: flex;
             justify-content: center;
             align-items: center;
             overflow: auto;
-        }`)
+        }`
+        this.#root.append(this.#style)
 
         this.#observer.observe(this)
     }
@@ -176,7 +176,7 @@ export class FixedLayout extends HTMLElement {
         }
     }
     async #showSpread({ left, right, center, side }) {
-        this.#root.replaceChildren()
+        this.#root.replaceChildren(this.#style)
         this.#left = null
         this.#right = null
         this.#center = null

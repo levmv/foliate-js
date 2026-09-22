@@ -839,7 +839,7 @@ class MOBI6 {
                 arr = concatTypedArray3(arr, a, raw.subarray(offset, next?.offset))
             })
         }
-        const str = this.mobi.decode(arr).replaceAll(mbpPagebreakRegex, '')
+        const str = this.mobi.decode(arr).replace(mbpPagebreakRegex, '')
         this.#textCache.set(section, str)
         return str
     }
