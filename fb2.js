@@ -38,7 +38,14 @@ const POEM = {
     'subtitle': ['h2', STYLE],
     'text-author': ['p', STYLE],
     'date': ['p', STYLE],
-    'stanza': 'stanza',
+    'stanza': ['div', {
+        'title': ['header', {
+            'p': ['strong', STYLE],
+            'empty-line': ['br'],
+        }],
+        'subtitle': ['p', STYLE],
+        'v': ['div', STYLE],
+    }],
 }
 
 const SECTION = {
@@ -101,22 +108,6 @@ class FB2Converter {
         el.setAttribute('href', node.getAttributeNS(NS.XLINK, 'href'))
         if (node.getAttribute('type') === 'note')
             el.setAttributeNS(NS.EPUB, 'epub:type', 'noteref')
-        return el
-    }
-    stanza(node) {
-        const el = this.convert(node, {
-            'stanza': ['p', {
-                'title': ['header', {
-                    'p': ['strong', STYLE],
-                    'empty-line': ['br'],
-                }],
-                'subtitle': ['p', STYLE],
-            }],
-        })
-        for (const child of node.children) if (child.nodeName === 'v') {
-            el.append(this.doc.createTextNode(child.textContent))
-            el.append(this.doc.createElement('br'))
-        }
         return el
     }
     convert(node, def) {
@@ -195,9 +186,12 @@ p {
 :not(p) + p, p:first-child {
     text-indent: 0;
 }
-.poem p {
+.stanza {
     text-indent: 0;
     margin: 1em 0;
+}
+.stanza > .v:empty::before {
+    content: '\\00a0';
 }
 .text-author, .date {
     text-align: end;
