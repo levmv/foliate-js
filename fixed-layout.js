@@ -103,6 +103,7 @@ export class FixedLayout extends HTMLElement {
         return new Promise(resolve => {
             iframe.addEventListener('load', () => {
                 const doc = iframe.contentDocument
+                iframe.setAttribute('aria-label', doc.title || 'Book content')
                 this.dispatchEvent(new CustomEvent('load', { detail: { doc, index } }))
                 const { width, height } = getViewport(doc, this.defaultViewport)
                 resolve({
@@ -339,9 +340,13 @@ export class FixedLayout extends HTMLElement {
         const resolved = await target
         const section = book.sections[resolved.index]
         if (!section) return
+        const hasFocus = this.getContents().some(({ doc }) => doc.hasFocus())
         const { index, side } = this.getSpreadOf(section)
         await this.goToSpread(index, side)
-        const { doc } = this.getContents().find(frame => frame.index === resolved.index)
+        const frame = this.getContents().find(frame => frame.index === resolved.index)
+        if (!frame || this.index !== resolved.index) return
+        const { doc } = frame
+        if (hasFocus) doc.defaultView.focus()
         const anchor = typeof resolved.anchor === 'function' ? resolved.anchor(doc) : resolved.anchor
         this.scrollToAnchor(anchor, resolved.select)
     }
@@ -349,6 +354,18 @@ export class FixedLayout extends HTMLElement {
         const node = anchor?.startContainer ?? anchor
         const doc = node?.ownerDocument
         if (!doc) return
+        if (!select && doc.hasFocus()) {
+            const el = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement
+            if (el?.focus && el.getClientRects().length) {
+                if (el.tabIndex < 0 && !el.hasAttribute('tabindex')) {
+                    el.setAttribute('tabindex', '-1')
+                    el.addEventListener('blur', () => {
+                        if (el.getAttribute('tabindex') === '-1') el.removeAttribute('tabindex')
+                    }, { once: true })
+                }
+                el.focus({ preventScroll: true })
+            }
+        }
         if (select) {
             const range = doc.createRange()
             if (anchor.startContainer) {

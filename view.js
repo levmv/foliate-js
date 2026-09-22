@@ -145,6 +145,7 @@ class CursorAutohider {
         return new CursorAutohider(el, this.#check, this.#state)
     }
     hide() {
+        if (this.#el.ownerDocument.getSelection()?.type === 'Range') return this.show()
         this.#el.style.cursor = 'none'
         this.#state.hidden = true
     }

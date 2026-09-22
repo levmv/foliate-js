@@ -335,6 +335,7 @@ class View {
             throwIfAborted(signal)
             const doc = this.document
             if (!doc?.body) throw new Error('Section has no document body')
+            this.#iframe.setAttribute('aria-label', doc.title || 'Book content')
             await waitForImages(doc, signal)
             // it needs to be visible for Firefox to get computed style
             this.#iframe.style.display = 'block'
@@ -605,6 +606,8 @@ export class Paginator extends HTMLElement {
     #scrollBounds
     #touchState
     #touchScrolled
+    #penActive = false
+    #focusingAnchor = false
     #lastVisibleRange
     constructor() {
         super()
@@ -720,14 +723,20 @@ export class Paginator extends HTMLElement {
         }, 250))
 
         const opts = { passive: false }
-        this.addEventListener('touchstart', this.#onTouchStart.bind(this), opts)
-        this.addEventListener('touchmove', this.#onTouchMove.bind(this), opts)
-        this.addEventListener('touchend', this.#onTouchEnd.bind(this))
-        this.addEventListener('load', ({ detail: { doc } }) => {
-            doc.addEventListener('touchstart', this.#onTouchStart.bind(this), opts)
-            doc.addEventListener('touchmove', this.#onTouchMove.bind(this), opts)
-            doc.addEventListener('touchend', this.#onTouchEnd.bind(this))
-        })
+        const listen = target => {
+            target.addEventListener('touchstart', this.#onTouchStart.bind(this), opts)
+            target.addEventListener('touchmove', this.#onTouchMove.bind(this), opts)
+            target.addEventListener('touchend', this.#onTouchEnd.bind(this))
+            target.addEventListener('touchcancel', () => {
+                this.#touchState = null
+                this.#touchScrolled = false
+            })
+            target.addEventListener('pointerdown', e => this.#penActive = e.pointerType === 'pen')
+            target.addEventListener('pointerup', () => this.#penActive = false)
+            target.addEventListener('pointercancel', () => this.#penActive = false)
+        }
+        listen(this)
+        this.addEventListener('load', ({ detail: { doc } }) => listen(doc))
 
         this.addEventListener('relocate', ({ detail }) => {
             if (detail.reason === 'selection') setSelectionTo(this.#anchor, 0)
@@ -769,7 +778,7 @@ export class Paginator extends HTMLElement {
                     this.#scrollToAnchor(selRange)
                 }
             })
-            doc.addEventListener('focusin', e => this.scrolled ? null :
+            doc.addEventListener('focusin', e => this.scrolled || this.#focusingAnchor ? null :
                 // NOTE: `requestAnimationFrame` is needed in WebKit
                 requestAnimationFrame(() => this.#scrollToAnchor(e.target)))
         })
@@ -1001,11 +1010,12 @@ export class Paginator extends HTMLElement {
             x: touch?.screenX, y: touch?.screenY,
             t: e.timeStamp,
             vx: 0, vy: 0,
+            stylus: touch?.touchType === 'stylus' || this.#penActive,
         }
     }
     #onTouchMove(e) {
         const state = this.#touchState
-        if (!state || state.pinched || !this.#view?.ready) return
+        if (!state || state.stylus || state.pinched || !this.#view?.ready) return
         state.pinched = globalThis.visualViewport.scale > 1
         if (this.scrolled || state.pinched) return
         if (e.touches.length > 1) {
@@ -1015,11 +1025,12 @@ export class Paginator extends HTMLElement {
         const doc = e.currentTarget?.getSelection ? e.currentTarget : this.#view?.document
         if (hasActiveTextSelection(doc)) state.selecting = true
         if (state.selecting) return
-        e.preventDefault()
         const touch = e.changedTouches[0]
         const x = touch.screenX, y = touch.screenY
         const dx = state.x - x, dy = state.y - y
-        const dt = e.timeStamp - state.t
+        if (Math.abs(dx) < 1 && Math.abs(dy) < 1) return
+        e.preventDefault()
+        const dt = Math.max(1, e.timeStamp - state.t)
         state.x = x
         state.y = y
         state.t = e.timeStamp
@@ -1031,15 +1042,16 @@ export class Paginator extends HTMLElement {
     #onTouchEnd(e) {
         this.#touchScrolled = false
         const doc = e.currentTarget?.getSelection ? e.currentTarget : this.#view?.document
-        if (!this.#touchState || this.scrolled || this.#touchState.selecting
+        const state = this.#touchState
+        if (!state || this.scrolled || state.stylus || state.pinched || state.selecting
             || hasActiveTextSelection(doc)) return
 
         // XXX: Firefox seems to report scale as 1... sometimes...?
         // at this point I'm basically throwing `requestAnimationFrame` at
         // anything that doesn't work
         requestAnimationFrame(async () => {
-            if (globalThis.visualViewport.scale === 1) try {
-                await this.snap(this.#touchState.vx, this.#touchState.vy)
+            if (state === this.#touchState && globalThis.visualViewport.scale === 1) try {
+                await this.snap(state.vx, state.vy)
             } catch (error) {
                 console.warn(error)
             }
@@ -1115,6 +1127,21 @@ export class Paginator extends HTMLElement {
             if (!rect) return this.scrolled
                 ? this.#scrollTo(0, reason) : this.#scrollToPage(1, reason)
             await this.#scrollToRect(rect, reason)
+            if (reason === 'navigation' && this.#view.document.hasFocus()) {
+                const node = anchor.startContainer ?? anchor
+                const el = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement
+                if (el?.focus) {
+                    if (el.tabIndex < 0 && !el.hasAttribute('tabindex')) {
+                        el.setAttribute('tabindex', '-1')
+                        el.addEventListener('blur', () => {
+                            if (el.getAttribute('tabindex') === '-1') el.removeAttribute('tabindex')
+                        }, { once: true })
+                    }
+                    this.#focusingAnchor = true
+                    try { el.focus({ preventScroll: true }) }
+                    finally { this.#focusingAnchor = false }
+                }
+            }
             return
         }
         // if anchor is a fraction
@@ -1181,9 +1208,9 @@ export class Paginator extends HTMLElement {
             }))
             this.#view = view
         }
+        if (hasFocus) this.focusView()
         await this.scrollToAnchor((typeof anchor === 'function'
             ? anchor(this.#view.document) : anchor) ?? 0, select)
-        if (hasFocus) this.focusView()
     }
     #canGoToIndex(index) {
         return index >= 0 && index <= this.sections.length - 1
