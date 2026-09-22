@@ -182,13 +182,27 @@ const setSelectionTo = (target, collapse) => {
 
 const getDirection = doc => {
     const { defaultView } = doc
-    const { writingMode, direction } = defaultView.getComputedStyle(doc.body)
+    let { writingMode, direction } = defaultView.getComputedStyle(doc.body)
+    if (writingMode === 'horizontal-tb') {
+        let parent = doc.body
+        for (let depth = 0; depth < 16; depth++) {
+            if (Array.from(parent.childNodes).some(node =>
+                (node.nodeType === 3 || node.nodeType === 4) && node.textContent.trim())) break
+            const children = Array.from(parent.children).filter(el =>
+                Array.from(el.getClientRects()).some(rect => rect.width && rect.height))
+            if (!children.length) break
+            const modes = children.map(el => defaultView.getComputedStyle(el).writingMode)
+            if (modes.every(mode => mode === modes[0]) && /^vertical-/.test(modes[0])) {
+                writingMode = modes[0]
+                break
+            }
+            if (children.length !== 1) break
+            parent = children[0]
+        }
+    }
     const vertical = writingMode === 'vertical-rl'
         || writingMode === 'vertical-lr'
-    const rtl = doc.body.dir === 'rtl'
-        || direction === 'rtl'
-        || doc.documentElement.dir === 'rtl'
-    return { vertical, rtl }
+    return { writingMode, vertical, rtl: direction === 'rtl' }
 }
 
 const getBackground = doc => {
@@ -246,8 +260,11 @@ class View {
     #column = true
     #size
     #layout = {}
-    #fragmentedStyles = new Map()
+    #fragmentedStyles = []
     #imageStyles = []
+    #directionStyles = []
+    #writingStyles = []
+    #loadedDoc = null
     constructor({ container, onExpand }) {
         this.container = container
         this.onExpand = onExpand
@@ -280,8 +297,12 @@ class View {
     get document() {
         return this.#iframe.contentDocument
     }
+    get ready() {
+        return this.#loadedDoc != null && this.document === this.#loadedDoc
+    }
     async load(src, afterLoad, beforeRender) {
         if (typeof src !== 'string') throw new Error(`${src} is not string`)
+        this.#loadedDoc = null
         this.#loadController?.abort()
         const controller = this.#loadController = new AbortController()
         const { signal } = controller
@@ -302,10 +323,16 @@ class View {
             const doc = this.document
             if (!doc?.body) throw new Error('Section has no document body')
             await waitForImages(doc, signal)
-            afterLoad?.(doc)
-
             // it needs to be visible for Firefox to get computed style
             this.#iframe.style.display = 'block'
+            const { writingMode, vertical: wrapped } = getDirection(doc)
+            if (wrapped && doc.defaultView.getComputedStyle(doc.body).writingMode !== writingMode) {
+                // A uniform chapter wrapper defines the page's writing mode.
+                // Apply it before load listeners measure the document as well.
+                overrideStyles(doc.documentElement, { 'writing-mode': writingMode }, this.#writingStyles)
+                overrideStyles(doc.body, { 'writing-mode': writingMode }, this.#writingStyles)
+            }
+            afterLoad?.(doc)
             const { vertical, rtl } = getDirection(doc)
             const background = getBackground(doc)
             this.#iframe.style.display = 'none'
@@ -317,6 +344,7 @@ class View {
             // Background measurement needs a stable layout before counting pages.
             if (this.container.loadDocument) await waitForFonts(doc, signal)
             throwIfAborted(signal)
+            this.#loadedDoc = doc
             this.render(layout)
             this.#observer.observe(doc.body)
             this.refreshFonts()
@@ -330,16 +358,32 @@ class View {
         if (!doc?.body || !signal) return
         waitForFonts(doc, signal).then(() => {
             if (!signal.aborted && this.document === doc) {
-                this.#restoreFragmentedStyles()
+                restoreStyles(this.#fragmentedStyles)
                 this.expand()
             }
         }, () => {})
     }
     render(layout) {
-        if (!layout) return
-        this.#restoreFragmentedStyles()
+        if (!layout || !this.ready) return
+        restoreStyles(this.#fragmentedStyles)
         this.#column = layout.flow !== 'scrolled'
         this.#layout = layout
+        this.#rtl = layout.rtl
+        restoreStyles(this.#directionStyles)
+        if (this.#column && !this.#vertical) {
+            const doc = this.document
+            const direction = this.#rtl ? 'rtl' : 'ltr'
+            if (doc.defaultView.getComputedStyle(doc.body).direction !== direction) {
+                const children = Array.from(doc.body.children, el =>
+                    [el, doc.defaultView.getComputedStyle(el).direction])
+                overrideStyles(doc.documentElement, { direction }, this.#directionStyles)
+                overrideStyles(doc.body, { direction }, this.#directionStyles)
+                // Order the columns by the spine while preserving authored text direction.
+                for (const [el, original] of children)
+                    if (original !== direction)
+                        overrideStyles(el, { direction: original }, this.#directionStyles)
+            }
+        }
         if (this.#column) this.columnize(layout)
         else this.scrolled(layout)
     }
@@ -420,14 +464,6 @@ class View {
                 'box-sizing': 'border-box',
             }, this.#imageStyles)
     }
-    #restoreFragmentedStyles() {
-        for (const [el, { value, priority, display }] of this.#fragmentedStyles) {
-            if (el.style.getPropertyValue('display') === display
-                && el.style.getPropertyPriority('display') === 'important')
-                el.style.setProperty('display', value, priority)
-        }
-        this.#fragmentedStyles.clear()
-    }
     #fragmentOverflowingBoxes() {
         const doc = this.document
         const root = doc.documentElement
@@ -450,16 +486,11 @@ class View {
             if (display && el.getBoundingClientRect()[vertical ? 'width' : 'height'] > available)
                 changes.push([el, display])
         }
-        for (const [el, display] of changes) {
-            this.#fragmentedStyles.set(el, {
-                value: el.style.getPropertyValue('display'),
-                priority: el.style.getPropertyPriority('display'), display,
-            })
-            el.style.setProperty('display', display, 'important')
-        }
+        for (const [el, display] of changes)
+            overrideStyles(el, { display }, this.#fragmentedStyles)
     }
     expand() {
-        if (this.#loadController?.signal.aborted || !this.document?.body) return
+        if (!this.ready || this.#loadController?.signal.aborted || !this.document?.body) return
         const { documentElement } = this.document
         if (this.#column) {
             this.#fragmentOverflowingBoxes()
@@ -518,10 +549,13 @@ class View {
         return this.#overlayer
     }
     destroy() {
+        this.#loadedDoc = null
         this.#loadController?.abort()
         this.#observer.disconnect()
-        this.#restoreFragmentedStyles()
+        restoreStyles(this.#fragmentedStyles)
         restoreStyles(this.#imageStyles)
+        restoreStyles(this.#directionStyles)
+        restoreStyles(this.#writingStyles)
     }
 }
 
@@ -789,7 +823,8 @@ export class Paginator extends HTMLElement {
     }
     #beforeRender({ vertical, rtl, background }) {
         this.#vertical = vertical
-        this.#rtl = rtl
+        this.#rtl = !vertical && (this.bookDir === 'rtl'
+            || this.bookDir !== 'ltr' && rtl)
         this.#top.classList.toggle('vertical', vertical)
 
         // set background to `doc` background
@@ -837,12 +872,12 @@ export class Paginator extends HTMLElement {
             this.#header.replaceChildren()
             this.#footer.replaceChildren()
 
-            return { width, height, flow, margin, gap, columnWidth }
+            return { width, height, flow, margin, gap, columnWidth, rtl: this.#rtl }
         }
 
         const divisor = Math.min(maxColumnCount, Math.ceil(size / maxInlineSize))
         const columnWidth = (size / divisor) - (vertical ? margin : gap)
-        this.setAttribute('dir', rtl ? 'rtl' : 'ltr')
+        this.setAttribute('dir', this.#rtl ? 'rtl' : 'ltr')
 
         const marginalDivisor = vertical
             ? Math.min(2, Math.ceil(width / maxInlineSize))
@@ -861,10 +896,10 @@ export class Paginator extends HTMLElement {
         this.#header.replaceChildren(...heads)
         this.#footer.replaceChildren(...feet)
 
-        return { height, width, margin, gap, columnWidth }
+        return { height, width, margin, gap, columnWidth, rtl: this.#rtl }
     }
     render() {
-        if (!this.#view?.document?.body) return
+        if (!this.#view?.ready) return
         this.#view.render(this.#beforeRender({
             vertical: this.#vertical,
             rtl: this.#rtl,
