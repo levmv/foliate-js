@@ -1,3 +1,5 @@
+import { waitForFonts, waitForImages, waitForEvent, withAbort, throwIfAborted } from './resource-wait.js'
+
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 const debounce = (f, wait, immediate) => {
@@ -43,7 +45,7 @@ const uncollapse = range => {
     const { endOffset, endContainer } = range
     if (endContainer.nodeType === 1) {
         const node = endContainer.childNodes[endOffset]
-        if (node?.nodeType === 1) return node
+        if (node?.nodeType === 1 && node.getClientRects().length) return node
         return endContainer
     }
     if (endOffset + 1 < endContainer.length) range.setEnd(endContainer, endOffset + 1)
@@ -213,6 +215,7 @@ const hasActiveTextSelection = doc => {
 }
 
 class View {
+    #loadController
     #observer = new ResizeObserver(() => this.expand())
     #element = document.createElement('div')
     #iframe = document.createElement('iframe')
@@ -257,35 +260,55 @@ class View {
     }
     async load(src, afterLoad, beforeRender) {
         if (typeof src !== 'string') throw new Error(`${src} is not string`)
-        return new Promise(resolve => {
-            this.#iframe.addEventListener('load', () => {
-                const doc = this.document
-                afterLoad?.(doc)
+        this.#loadController?.abort()
+        const controller = this.#loadController = new AbortController()
+        const { signal } = controller
+        const externalSignal = this.container.loadSignal
+        const abort = () => controller.abort()
+        if (externalSignal?.aborted) abort()
+        else externalSignal?.addEventListener('abort', abort, { once: true })
+        try {
+            throwIfAborted(signal)
+            if (this.container.loadDocument) {
+                await withAbort(this.container.loadDocument(this.#iframe, src, signal), signal)
+            } else {
+                const ready = waitForEvent(this.#iframe, ['load'], signal)
+                this.#iframe.src = src
+                await ready
+            }
+            throwIfAborted(signal)
+            const doc = this.document
+            if (!doc?.body) throw new Error('Section has no document body')
+            await waitForImages(doc, signal)
+            afterLoad?.(doc)
 
-                // it needs to be visible for Firefox to get computed style
-                this.#iframe.style.display = 'block'
-                const { vertical, rtl } = getDirection(doc)
-                const background = getBackground(doc)
-                this.#iframe.style.display = 'none'
-
-                this.#vertical = vertical
-                this.#rtl = rtl
-
-                this.#contentRange.selectNodeContents(doc.body)
-                const layout = beforeRender?.({ vertical, rtl, background })
-                this.#iframe.style.display = 'block'
-                this.render(layout)
-                this.#observer.observe(doc.body)
-
-                // the resize observer above doesn't work in Firefox
-                // (see https://bugzilla.mozilla.org/show_bug.cgi?id=1832939)
-                // until the bug is fixed we can at least account for font load
-                doc.fonts.ready.then(() => this.expand())
-
-                resolve()
-            }, { once: true })
-            this.#iframe.src = src
-        })
+            // it needs to be visible for Firefox to get computed style
+            this.#iframe.style.display = 'block'
+            const { vertical, rtl } = getDirection(doc)
+            const background = getBackground(doc)
+            this.#iframe.style.display = 'none'
+            this.#vertical = vertical
+            this.#rtl = rtl
+            this.#contentRange.selectNodeContents(doc.body)
+            const layout = beforeRender?.({ vertical, rtl, background })
+            this.#iframe.style.display = 'block'
+            // Background measurement needs a stable layout before counting pages.
+            if (this.container.loadDocument) await waitForFonts(doc, signal)
+            throwIfAborted(signal)
+            this.render(layout)
+            this.#observer.observe(doc.body)
+            this.refreshFonts()
+        } finally {
+            externalSignal?.removeEventListener('abort', abort)
+        }
+    }
+    refreshFonts() {
+        const doc = this.document
+        const signal = this.#loadController?.signal
+        if (!doc?.body || !signal) return
+        waitForFonts(doc, signal).then(() => {
+            if (!signal.aborted && this.document === doc) this.expand()
+        }, () => {})
     }
     render(layout) {
         if (!layout) return
@@ -311,7 +334,7 @@ class View {
         this.setImageSize()
         this.expand()
     }
-    columnize({ width, height, gap, columnWidth }) {
+    columnize({ width, height, margin, gap, columnWidth }) {
         const vertical = this.#vertical
         this.#size = vertical ? height : width
 
@@ -319,12 +342,12 @@ class View {
         setStylesImportant(doc.documentElement, {
             'box-sizing': 'border-box',
             'column-width': `${Math.trunc(columnWidth)}px`,
-            'column-gap': `${gap}px`,
+            'column-gap': vertical ? `${margin}px` : `${gap}px`,
             'column-fill': 'auto',
             ...(vertical
                 ? { 'width': `${width}px` }
                 : { 'height': `${height}px` }),
-            'padding': vertical ? `${gap / 2}px 0` : `0 ${gap / 2}px`,
+            'padding': vertical ? `${margin / 2}px ${gap}px` : `0 ${gap / 2}px`,
             'overflow': 'hidden',
             // force wrap long words
             'overflow-wrap': 'break-word',
@@ -365,6 +388,7 @@ class View {
         }
     }
     expand() {
+        if (this.#loadController?.signal.aborted || !this.document?.body) return
         const { documentElement } = this.document
         if (this.#column) {
             const side = this.#vertical ? 'height' : 'width'
@@ -414,19 +438,22 @@ class View {
         this.onExpand()
     }
     set overlayer(overlayer) {
+        this.#overlayer?.element.remove()
         this.#overlayer = overlayer
-        this.#element.append(overlayer.element)
+        if (overlayer) this.#element.append(overlayer.element)
     }
     get overlayer() {
         return this.#overlayer
     }
     destroy() {
-        if (this.document) this.#observer.unobserve(this.document.body)
+        this.#loadController?.abort()
+        this.#observer.disconnect()
     }
 }
 
 // NOTE: everything here assumes the so-called "negative scroll type" for RTL
 export class Paginator extends HTMLElement {
+    #navigationController = new AbortController()
     static observedAttributes = [
         'flow', 'gap', 'margin',
         'max-inline-size', 'max-block-size', 'max-column-count',
@@ -549,7 +576,7 @@ export class Paginator extends HTMLElement {
         <div id="top">
             <div id="background" part="filter"></div>
             <div id="header"></div>
-            <div id="container"></div>
+            <div id="container" part="container"></div>
             <div id="footer"></div>
         </div>
         `
@@ -640,6 +667,8 @@ export class Paginator extends HTMLElement {
             case 'max-block-size':
             case 'max-column-count':
                 this.#top.style.setProperty('--_' + name, value)
+                // Host styles can keep the container size unchanged.
+                this.render()
                 break
             case 'max-inline-size':
                 // needs explicit `render()` as it doesn't necessarily resize
@@ -671,6 +700,10 @@ export class Paginator extends HTMLElement {
     #createView() {
         if (this.#view) {
             this.#view.destroy()
+            if (this.loadDocument) {
+                this.#view.overlayer = null
+                return this.#view
+            }
             this.#container.removeChild(this.#view.element)
         }
         this.#view = new View({
@@ -734,7 +767,7 @@ export class Paginator extends HTMLElement {
         }
 
         const divisor = Math.min(maxColumnCount, Math.ceil(size / maxInlineSize))
-        const columnWidth = (size / divisor) - gap
+        const columnWidth = (size / divisor) - (vertical ? margin : gap)
         this.setAttribute('dir', rtl ? 'rtl' : 'ltr')
 
         const marginalDivisor = vertical
@@ -757,7 +790,7 @@ export class Paginator extends HTMLElement {
         return { height, width, margin, gap, columnWidth }
     }
     render() {
-        if (!this.#view) return
+        if (!this.#view?.document?.body) return
         this.#view.render(this.#beforeRender({
             vertical: this.#vertical,
             rtl: this.#rtl,
@@ -806,7 +839,10 @@ export class Paginator extends HTMLElement {
         element[scrollProp] = Math.max(min, Math.min(max,
             element[scrollProp] + delta))
     }
-    snap(vx, vy) {
+    async snap(vx, vy) {
+        const view = this.#view
+        const index = this.#index
+        const anchor = this.#anchor
         const velocity = this.#vertical ? vy : vx
         const [offset, a, b] = this.#scrollBounds
         const { start, end, pages, size } = this
@@ -817,13 +853,19 @@ export class Paginator extends HTMLElement {
             Math.max(min, Math.min(max, (start + end) / 2
                 + (isNaN(d) ? 0 : d))) / size)
 
-        this.#scrollToPage(page, 'snap').then(() => {
+        try {
+            await this.#scrollToPage(page, 'snap')
             const dir = page <= 0 ? -1 : page >= pages - 1 ? 1 : null
-            if (dir) return this.#goTo({
+            if (dir) await this.#goTo({
                 index: this.#adjacentIndex(dir),
                 anchor: dir < 0 ? () => 1 : () => 0,
             })
-        })
+        } catch (error) {
+            if (view && this.#view === view && this.#index === index
+                && !this.#navigationController.signal.aborted)
+                await this.#scrollToAnchor(anchor)
+            throw error
+        }
     }
     #onTouchStart(e) {
         const touch = e.changedTouches[0]
@@ -866,9 +908,12 @@ export class Paginator extends HTMLElement {
         // XXX: Firefox seems to report scale as 1... sometimes...?
         // at this point I'm basically throwing `requestAnimationFrame` at
         // anything that doesn't work
-        requestAnimationFrame(() => {
-            if (globalThis.visualViewport.scale === 1)
-                this.snap(this.#touchState.vx, this.#touchState.vy)
+        requestAnimationFrame(async () => {
+            if (globalThis.visualViewport.scale === 1) try {
+                await this.snap(this.#touchState.vx, this.#touchState.vy)
+            } catch (error) {
+                console.warn(error)
+            }
         })
     }
     // allows one to process rects as if they were LTR and horizontal
@@ -978,7 +1023,9 @@ export class Paginator extends HTMLElement {
         this.dispatchEvent(new CustomEvent('relocate', { detail }))
     }
     async #display(promise) {
-        const { index, src, anchor, onLoad, select } = await promise
+        const signal = this.#navigationController.signal
+        const { index, src, anchor, onLoad, select } = await withAbort(promise, signal)
+        throwIfAborted(signal)
         this.#index = index
         const hasFocus = this.#view?.document?.hasFocus()
         if (src) {
@@ -1011,6 +1058,7 @@ export class Paginator extends HTMLElement {
         return index >= 0 && index <= this.sections.length - 1
     }
     async #goTo({ index, anchor, select}) {
+        if (index == null || !this.sections[index]) return
         if (index === this.#index) await this.#display({ index, anchor, select })
         else {
             const oldIndex = this.#index
@@ -1019,12 +1067,10 @@ export class Paginator extends HTMLElement {
                 this.setStyles(this.#styles)
                 this.dispatchEvent(new CustomEvent('load', { detail }))
             }
-            await this.#display(Promise.resolve(this.sections[index].load())
-                .then(src => ({ index, src, anchor, onLoad, select }))
-                .catch(e => {
-                    console.warn(e)
-                    console.warn(new Error(`Failed to load section ${index}`))
-                    return {}
+            await this.#display(Promise.resolve().then(() => this.sections[index].load())
+                .then(src => {
+                    if (!src) throw new Error(`Failed to load section ${index}`)
+                    return { index, src, anchor, onLoad, select }
                 }))
         }
     }
@@ -1069,14 +1115,25 @@ export class Paginator extends HTMLElement {
     async #turnPage(dir, distance) {
         if (this.#locked) return
         this.#locked = true
-        const prev = dir === -1
-        const shouldGo = await (prev ? this.#scrollPrev(distance) : this.#scrollNext(distance))
-        if (shouldGo) await this.#goTo({
-            index: this.#adjacentIndex(dir),
-            anchor: prev ? () => 1 : () => 0,
-        })
-        if (shouldGo || !this.hasAttribute('animated')) await wait(100)
-        this.#locked = false
+        const view = this.#view
+        const index = this.#index
+        const anchor = this.#anchor
+        try {
+            const prev = dir === -1
+            const shouldGo = await (prev ? this.#scrollPrev(distance) : this.#scrollNext(distance))
+            if (shouldGo) await this.#goTo({
+                index: this.#adjacentIndex(dir),
+                anchor: prev ? () => 1 : () => 0,
+            })
+            if (shouldGo || !this.hasAttribute('animated')) await wait(100)
+        } catch (error) {
+            if (view && this.#view === view && this.#index === index
+                && !this.#navigationController.signal.aborted)
+                await this.#scrollToAnchor(anchor)
+            throw error
+        } finally {
+            this.#locked = false
+        }
     }
     prev(distance) {
         return this.#turnPage(-1, distance)
@@ -1118,18 +1175,22 @@ export class Paginator extends HTMLElement {
         } else $style.textContent = styles
 
         // NOTE: needs `requestAnimationFrame` in Chromium
-        requestAnimationFrame(() =>
-            this.#background.style.background = getBackground(this.#view.document))
+        requestAnimationFrame(() => {
+            const doc = this.#view?.document
+            if (doc?.body) this.#background.style.background = getBackground(doc)
+        })
 
         // needed because the resize observer doesn't work in Firefox
-        this.#view?.document?.fonts?.ready?.then(() => this.#view.expand())
+        this.#view?.refreshFonts()
     }
     focusView() {
         this.#view.document.defaultView.focus()
     }
     destroy() {
-        this.#observer.unobserve(this)
-        this.#view.destroy()
+        if (this.#navigationController.signal.aborted) return
+        this.#navigationController.abort()
+        this.#observer.disconnect()
+        this.#view?.destroy()
         this.#view = null
         this.sections[this.#index]?.unload?.()
         this.#mediaQuery.removeEventListener('change', this.#mediaQueryListener)
