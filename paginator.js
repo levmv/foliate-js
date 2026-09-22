@@ -38,10 +38,13 @@ const animate = (a, b, duration, ease, render) => new Promise(resolve => {
     requestAnimationFrame(step)
 })
 
-// collapsed range doesn't return client rects sometimes (or always?)
-// try make get a non-collapsed range or element
+// Collapsed ranges and boundaries before an image may have no rectangles.
+// Find geometry at their start without changing the saved range.
 const uncollapse = range => {
-    if (!range?.collapsed) return range
+    if (!range?.startContainer) return range
+    if (!range.collapsed && range.getClientRects().length) return range
+    range = range.cloneRange()
+    range.collapse(true)
     const { endOffset, endContainer } = range
     if (endContainer.nodeType === 1) {
         const node = endContainer.childNodes[endOffset]
@@ -209,6 +212,23 @@ const setStylesImportant = (el, styles) => {
     for (const [k, v] of Object.entries(styles)) style.setProperty(k, v, 'important')
 }
 
+const overrideStyles = (el, styles, restore) => {
+    for (const [property, value] of Object.entries(styles)) {
+        const original = el.style.getPropertyValue(property)
+        const priority = el.style.getPropertyPriority(property)
+        el.style.setProperty(property, value, 'important')
+        const applied = el.style.getPropertyValue(property)
+        restore.push(() => {
+            if (el.style.getPropertyValue(property) === applied
+                && el.style.getPropertyPriority(property) === 'important')
+                el.style.setProperty(property, original, priority)
+        })
+    }
+}
+const restoreStyles = restore => {
+    for (const undo of restore.splice(0)) undo()
+}
+
 const hasActiveTextSelection = doc => {
     const selection = doc?.getSelection?.()
     return Boolean(selection?.rangeCount && !selection.isCollapsed)
@@ -226,6 +246,8 @@ class View {
     #column = true
     #size
     #layout = {}
+    #fragmentedStyles = new Map()
+    #imageStyles = []
     constructor({ container, onExpand }) {
         this.container = container
         this.onExpand = onExpand
@@ -307,11 +329,15 @@ class View {
         const signal = this.#loadController?.signal
         if (!doc?.body || !signal) return
         waitForFonts(doc, signal).then(() => {
-            if (!signal.aborted && this.document === doc) this.expand()
+            if (!signal.aborted && this.document === doc) {
+                this.#restoreFragmentedStyles()
+                this.expand()
+            }
         }, () => {})
     }
     render(layout) {
         if (!layout) return
+        this.#restoreFragmentedStyles()
         this.#column = layout.flow !== 'scrolled'
         this.#layout = layout
         if (this.#column) this.columnize(layout)
@@ -367,30 +393,76 @@ class View {
         this.expand()
     }
     setImageSize() {
-        const { width, height, margin } = this.#layout
+        restoreStyles(this.#imageStyles)
+        const { width, height, gap, columnWidth } = this.#layout
         const vertical = this.#vertical
         const doc = this.document
-        for (const el of doc.body.querySelectorAll('img, svg, video')) {
-            // preserve max size if they are already set
+        const availableWidth = this.#column
+            ? vertical ? width - 2 * gap : columnWidth
+            : vertical ? Infinity : Math.min(columnWidth, width - 2 * gap)
+        const availableHeight = this.#column
+            ? vertical ? columnWidth : height
+            : vertical ? Math.min(columnWidth, height - 2 * gap) : Infinity
+        const clamp = (value, limit) => !Number.isFinite(limit) ? value
+            : value === 'none' ? `${Math.max(0, limit)}px`
+            : `min(${value}, ${Math.max(0, limit)}px)`
+        const sizes = Array.from(doc.body.querySelectorAll('img, svg, video'), el => {
             const { maxHeight, maxWidth } = doc.defaultView.getComputedStyle(el)
-            setStylesImportant(el, {
-                'max-height': vertical
-                    ? (maxHeight !== 'none' && maxHeight !== '0px' ? maxHeight : '100%')
-                    : `${height - margin * 2}px`,
-                'max-width': vertical
-                    ? `${width - margin * 2}px`
-                    : (maxWidth !== 'none' && maxWidth !== '0px' ? maxWidth : '100%'),
+            return [el, maxHeight, maxWidth]
+        })
+        for (const [el, maxHeight, maxWidth] of sizes)
+            overrideStyles(el, {
+                'max-height': clamp(maxHeight, availableHeight),
+                'max-width': clamp(maxWidth, availableWidth),
                 'object-fit': 'contain',
                 'page-break-inside': 'avoid',
                 'break-inside': 'avoid',
                 'box-sizing': 'border-box',
+            }, this.#imageStyles)
+    }
+    #restoreFragmentedStyles() {
+        for (const [el, { value, priority, display }] of this.#fragmentedStyles) {
+            if (el.style.getPropertyValue('display') === display
+                && el.style.getPropertyPriority('display') === 'important')
+                el.style.setProperty('display', value, priority)
+        }
+        this.#fragmentedStyles.clear()
+    }
+    #fragmentOverflowingBoxes() {
+        const doc = this.document
+        const root = doc.documentElement
+        const vertical = this.#vertical
+        const overflow = vertical ? root.scrollWidth - root.clientWidth
+            : root.scrollHeight - root.clientHeight
+        if (overflow <= 1) return
+        const { width, height, gap } = this.#layout
+        const available = vertical ? width - 2 * gap : height
+        if (!(available > 0)) return
+        const fragmentable = {
+            'inline-block': 'block', 'inline-flex': 'flex',
+            'inline-grid': 'grid', 'inline-table': 'table',
+        }
+        // Atomic inline boxes cannot split across columns in some engines.
+        // Inspect only overflowing documents and leave small boxes unchanged.
+        const changes = []
+        for (const el of doc.body.querySelectorAll('*')) {
+            const display = fragmentable[doc.defaultView.getComputedStyle(el).display]
+            if (display && el.getBoundingClientRect()[vertical ? 'width' : 'height'] > available)
+                changes.push([el, display])
+        }
+        for (const [el, display] of changes) {
+            this.#fragmentedStyles.set(el, {
+                value: el.style.getPropertyValue('display'),
+                priority: el.style.getPropertyPriority('display'), display,
             })
+            el.style.setProperty('display', display, 'important')
         }
     }
     expand() {
         if (this.#loadController?.signal.aborted || !this.document?.body) return
         const { documentElement } = this.document
         if (this.#column) {
+            this.#fragmentOverflowingBoxes()
             const side = this.#vertical ? 'height' : 'width'
             const otherSide = this.#vertical ? 'width' : 'height'
             const contentRect = this.#contentRange.getBoundingClientRect()
@@ -448,6 +520,8 @@ class View {
     destroy() {
         this.#loadController?.abort()
         this.#observer.disconnect()
+        this.#restoreFragmentedStyles()
+        restoreStyles(this.#imageStyles)
     }
 }
 
@@ -763,7 +837,7 @@ export class Paginator extends HTMLElement {
             this.#header.replaceChildren()
             this.#footer.replaceChildren()
 
-            return { flow, margin, gap, columnWidth }
+            return { width, height, flow, margin, gap, columnWidth }
         }
 
         const divisor = Math.min(maxColumnCount, Math.ceil(size / maxInlineSize))
