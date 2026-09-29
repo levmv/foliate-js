@@ -97,7 +97,6 @@ const getBoundingClientRect = target => {
 }
 
 const getVisibleRange = (doc, start, end, mapRect) => {
-    // first get all visible nodes
     const acceptNode = node => {
         const name = node.localName?.toLowerCase()
         // ignore all scripts, styles, and their children
@@ -106,9 +105,12 @@ const getVisibleRange = (doc, start, end, mapRect) => {
             const style = doc.defaultView.getComputedStyle(node)
             if (style.display === 'none') return FILTER_REJECT
             // Hidden and boxless wrappers can still have visible descendants.
-            if (style.visibility !== 'visible' || !node.getClientRects().length)
+            if (style.visibility !== 'visible') return FILTER_SKIP
+            const rect = node.getBoundingClientRect()
+            // A zero rectangle can mean an empty box or no box at all.
+            if (!rect.width && !rect.height && !node.getClientRects().length)
                 return FILTER_SKIP
-            const { left, right } = mapRect(node.getBoundingClientRect())
+            const { left, right } = mapRect(rect)
             // no need to check child nodes if it's completely out of view
             if (right < start || left > end) return FILTER_REJECT
             // elements must be completely in view to be considered visible
@@ -130,21 +132,19 @@ const getVisibleRange = (doc, start, end, mapRect) => {
             // create range to get rect
             const range = doc.createRange()
             range.selectNodeContents(node)
-            if (!range.getClientRects().length) return FILTER_REJECT
-            const { left, right } = mapRect(range.getBoundingClientRect())
+            const rect = range.getBoundingClientRect()
+            if (!rect.width && !rect.height && !range.getClientRects().length)
+                return FILTER_REJECT
+            const { left, right } = mapRect(rect)
             // it's visible if any part of it is in view
             if (right >= start && left <= end) return FILTER_ACCEPT
         }
         return FILTER_SKIP
     }
-    const walker = doc.createTreeWalker(doc.body, filter, { acceptNode })
-    const nodes = []
-    for (let node = walker.nextNode(); node; node = walker.nextNode())
-        nodes.push(node)
-
-    // we're only interested in the first and last visible nodes
-    const from = nodes[0] ?? doc.body
-    const to = nodes[nodes.length - 1] ?? from
+    const walker = doc.createTreeWalker(doc.body, filter, acceptNode)
+    const from = walker.nextNode() ?? doc.body
+    let to = from
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) to = node
 
     // find the offset at which visibility changes
     const startOffset = from.nodeType === 1 ? 0
@@ -199,17 +199,26 @@ const getDirection = doc => {
     if (writingMode === 'horizontal-tb') {
         let parent = doc.body
         for (let depth = 0; depth < 16; depth++) {
+            const children = []
+            const modes = []
+            for (const el of parent.children) {
+                if (!Array.from(el.getClientRects()).some(rect => rect.width && rect.height)) continue
+                children.push(el)
+                modes.push(defaultView.getComputedStyle(el).writingMode)
+                // Two ordinary blocks already rule out a uniform vertical
+                // wrapper. Avoid measuring every paragraph of a large chapter.
+                if (children.length > 1 && (!/^vertical-/.test(modes[0])
+                    || modes[modes.length - 1] !== modes[0])) break
+            }
+            const uniformVertical = modes.length && /^vertical-/.test(modes[0])
+                && modes.every(mode => mode === modes[0])
+            if (!uniformVertical && children.length !== 1) break
             if (Array.from(parent.childNodes).some(node =>
                 (node.nodeType === 3 || node.nodeType === 4) && node.textContent.trim())) break
-            const children = Array.from(parent.children).filter(el =>
-                Array.from(el.getClientRects()).some(rect => rect.width && rect.height))
-            if (!children.length) break
-            const modes = children.map(el => defaultView.getComputedStyle(el).writingMode)
-            if (modes.every(mode => mode === modes[0]) && /^vertical-/.test(modes[0])) {
+            if (uniformVertical) {
                 writingMode = modes[0]
                 break
             }
-            if (children.length !== 1) break
             parent = children[0]
         }
     }
@@ -293,10 +302,13 @@ class View {
             justifyContent: 'center',
             alignItems: 'center',
         })
+        // Keep layout active while parsing so large chapters can reflow
+        // incrementally without showing unfinished content.
         Object.assign(this.#iframe.style, {
             overflow: 'hidden',
             border: '0',
-            display: 'none',
+            display: 'block',
+            visibility: 'hidden',
             width: '100%', height: '100%',
         })
         // `allow-scripts` is needed for events because of WebKit bug
@@ -316,6 +328,7 @@ class View {
     async load(src, afterLoad, beforeRender) {
         if (typeof src !== 'string') throw new Error(`${src} is not string`)
         this.#loadedDoc = null
+        this.#iframe.style.visibility = 'hidden'
         this.#loadController?.abort()
         const controller = this.#loadController = new AbortController()
         const { signal } = controller
@@ -337,8 +350,6 @@ class View {
             if (!doc?.body) throw new Error('Section has no document body')
             this.#iframe.setAttribute('aria-label', doc.title || 'Book content')
             await waitForImages(doc, signal)
-            // it needs to be visible for Firefox to get computed style
-            this.#iframe.style.display = 'block'
             const { writingMode, vertical: wrapped } = getDirection(doc)
             if (wrapped && doc.defaultView.getComputedStyle(doc.body).writingMode !== writingMode) {
                 // A uniform chapter wrapper defines the page's writing mode.
@@ -349,16 +360,15 @@ class View {
             afterLoad?.(doc)
             const { vertical, rtl } = getDirection(doc)
             const background = getBackground(doc)
-            this.#iframe.style.display = 'none'
             this.#vertical = vertical
             this.#rtl = rtl
             this.#contentRange.selectNodeContents(doc.body)
             const layout = beforeRender?.({ vertical, rtl, background })
-            this.#iframe.style.display = 'block'
             // Background measurement needs a stable layout before counting pages.
             if (this.container.loadDocument) await waitForFonts(doc, signal)
             throwIfAborted(signal)
             this.#loadedDoc = doc
+            this.#iframe.style.removeProperty('visibility')
             this.render(layout)
             this.#observer.observe(doc.body)
             this.refreshFonts()
