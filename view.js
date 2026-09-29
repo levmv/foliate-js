@@ -261,6 +261,10 @@ export class View extends HTMLElement {
         }
         this.renderer.setAttribute('exportparts', 'head,foot,filter,container')
         this.renderer.addEventListener('load', e => this.#onLoad(e.detail))
+        this.renderer.addEventListener('unload', ({ detail }) => {
+            if (this.tts?.doc === detail.doc) this.tts = null
+            this.#emit('unload', detail)
+        })
         this.renderer.addEventListener('relocate', e => this.#onRelocate(e.detail))
         this.renderer.addEventListener('create-overlayer', e =>
             e.detail.attach(this.#createOverlayer(e.detail)))
@@ -277,7 +281,7 @@ export class View extends HTMLElement {
                 this.renderer.goTo(resolved)
                     .then(() => {
                         const { doc } = this.renderer.getContents()
-                            .find(x => x.index = resolved.index)
+                            .find(x => x.index === resolved.index)
                         const el = resolved.anchor(doc)
                         el.classList.add(activeClass)
                         if (playbackActiveClass) el.ownerDocument
@@ -328,8 +332,8 @@ export class View extends HTMLElement {
     #emit(name, detail, cancelable) {
         return this.dispatchEvent(new CustomEvent(name, { detail, cancelable }))
     }
-    #onRelocate({ reason, range, index, fraction, size }) {
-        const progress = this.#sectionProgress?.getProgress(index, fraction, size) ?? {}
+    #onRelocate({ reason, range, index, fraction, size, end }) {
+        const progress = this.#sectionProgress?.getProgress(index, fraction, size, end) ?? {}
         const tocItem = this.#tocProgress?.getProgress(index, range)
         const pageItem = this.#pageProgress?.getProgress(index, range)
         const cfi = this.getCFI(index, range)
@@ -585,14 +589,14 @@ export class View extends HTMLElement {
         this.#searchResults.clear()
     }
     async initTTS(granularity = 'word', highlight) {
-        const doc = this.renderer.getContents()[0].doc
+        const { doc } = this.renderer.getCurrentContent?.() ?? this.renderer.getContents()[0]
         if (this.tts && this.tts.doc === doc) return
         const { TTS } = await import('./tts.js')
         this.tts = new TTS(doc, textWalker, highlight || (range =>
             this.renderer.scrollToAnchor(range, true)), granularity)
     }
     startMediaOverlay() {
-        const { index } = this.renderer.getContents()[0]
+        const { index } = this.renderer.getCurrentContent?.() ?? this.renderer.getContents()[0]
         return this.mediaOverlay.start(index)
     }
 }

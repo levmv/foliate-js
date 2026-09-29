@@ -150,10 +150,27 @@ A renderer's interface is currently mainly:
 - `.goTo({ index, anchor })`: navigate to a destination. The argument has the same type as the one returned by `.resolveHref()` in the book object.
 - `.prev()`: go to previous page.
 - `.next()`: go to next page.
+- `.index`: the current section index.
+- `.getContents()`: return the available section contents as `{ doc, index, overlayer }`.
+  Continuous scrolling can also retain neighbours and an offscreen selection;
+  the first result is not necessarily the current section.
+- `.getCurrentContent()`: return the current content as `{ doc, index, overlayer }` in the
+  reflowable renderer, or `undefined` before a section is ready.
+- `.focusView()`: focus the reading surface in the reflowable renderer, including
+  the native scroll container in scrolled mode.
 
 It has the following custom events:
 - `load`, when a section is loaded. Its `event.detail` has two properties, `doc`, the `Document` object, and `index`, the index of the section.
+  A neighbouring section can load without navigation; use `relocate` to track
+  the reading position.
+- `unload`, when the reflowable renderer releases a document previously reported
+  by `load`. Its `event.detail` contains the same `doc` and `index`. It fires
+  before removing the document, allowing the host to release document-bound state.
 - `relocate`, when the location changes. Its `event.detail` has the properties `range`, `index`, and `fraction`, where `range` is a `Range` object containing the current visible area, and `fraction` is a number between 0 and 1, representing the reading progress within the section.
+  Continuous scrolling also provides `end`, with the `index` and `fraction` at
+  the end of the visible area, which can lie in a different section. The range
+  stays in the first visible section so saved CFIs identify where reading
+  resumes; the view uses `end` for overall progress.
 - `create-overlayer`, which allows adding an overlay to the page. The `event.detail` has the properties `doc`, `index`, and a function `attach(overlay)`, which should be called with an overlayer object (see the description for `overlayer.js` below).
 
 Both renderers have the [`part`](https://developer.mozilla.org/en-US/docs/Web/HTML/Global_attributes/part) named `filter`, which you can apply CSS filters to, to e.g. invert colors or adjust brightness:
@@ -170,12 +187,15 @@ The filter only applies to the book itself, leaving overlaid elements such as hi
 
 The paginator uses the same pagination strategy as [Epub.js](https://github.com/futurepress/epub.js): it uses CSS multi-column. As such it shares much of the same limitations (it's slow, some CSS styles do not work as expected, and other bugs). There are a few differences:
 - It is a totally standalone module. You can use it to paginate any content.
-- It is much simpler, but currently there's no support for continuous scrolling.
 - It has no concept of CFIs and operates on `Range` objects directly. 
 - It uses bisecting to find the current visible range, which is more accurate than what Epub.js does.
 - It has an internal `#anchor` property, which can be a `Range`, `Element`, or a fraction that represents the current location. The view is *anchored* to it no matter how you resize the window.
 - It supports more than two columns.
 - It supports switching between scrolled and paginated mode without reloading (I can't figure out how to do this in Epub.js).
+
+Scrolled mode continues across sections with the same writing mode. At a writing-mode
+boundary or a failed background load, use `.prev()` or `.next()` for an explicit
+transition or retry.
 
 The layout can be configured by setting the following attributes:
 - `animated`: a [boolean attribute](https://developer.mozilla.org/en-US/docs/Glossary/Boolean/HTML). If present, adds a sliding transition effect.

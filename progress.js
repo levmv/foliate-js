@@ -56,27 +56,24 @@ export class TOCProgress {
 }
 
 export class SectionProgress {
+    #offsets = [0]
     constructor(sections, sizePerLoc, sizePerTimeUnit) {
         this.sizes = sections.map(s => s.linear != 'no' && s.size > 0 ? s.size : 0)
         this.sizePerLoc = sizePerLoc
         this.sizePerTimeUnit = sizePerTimeUnit
-        this.sizeTotal = this.sizes.reduce((a, b) => a + b, 0)
-        this.sectionFractions = this.#getSectionFractions()
-    }
-    #getSectionFractions() {
-        const { sizeTotal } = this
-        const results = [0]
         let sum = 0
-        for (const size of this.sizes) results.push((sum += size) / sizeTotal)
-        return results
+        for (const size of this.sizes) this.#offsets.push(sum += size)
+        this.sizeTotal = sum
+        this.sectionFractions = this.#offsets.map(size => size / sum)
     }
-    // get progress given index of and fractions within a section
-    getProgress(index, fractionInSection, pageFraction = 0) {
+    getProgress(index, fractionInSection, pageFraction = 0, end) {
         const { sizes, sizePerLoc, sizePerTimeUnit, sizeTotal } = this
         const sizeInSection = sizes[index] ?? 0
-        const sizeBefore = sizes.slice(0, index).reduce((a, b) => a + b, 0)
+        const sizeBefore = this.#offsets[index] ?? 0
         const size = sizeBefore + fractionInSection * sizeInSection
-        const nextSize = size + pageFraction * sizeInSection
+        const nextSize = end
+            ? this.#offsets[end.index] + end.fraction * (sizes[end.index] ?? 0)
+            : size + pageFraction * sizeInSection
         const remainingTotal = sizeTotal - size
         const remainingSection = (1 - fractionInSection) * sizeInSection
         return {
@@ -96,7 +93,6 @@ export class SectionProgress {
             },
         }
     }
-    // the inverse of `getProgress`
     // get index of and fraction in section based on total fraction
     getSection(fraction) {
         if (fraction <= 0) return [0, 0]
